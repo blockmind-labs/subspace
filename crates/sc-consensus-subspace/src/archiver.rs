@@ -508,7 +508,10 @@ where
             }
         }
 
-        signed_block.encode()
+        const LARGE_BLOCK: usize = 1024 * 1024;
+        let mut block = signed_block.encode();
+        block.resize(LARGE_BLOCK, 0);
+        block
     }
 }
 
