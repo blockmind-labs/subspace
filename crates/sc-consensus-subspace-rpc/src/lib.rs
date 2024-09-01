@@ -54,7 +54,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use subspace_archiving::archiver::NewArchivedSegment;
 use subspace_core_primitives::crypto::kzg::Kzg;
-use subspace_core_primitives::objects::GlobalObjectMapping;
+use subspace_core_primitives::objects::{GlobalObject, GlobalObjectMapping};
 use subspace_core_primitives::{
     Blake3Hash, BlockHash, HistorySize, Piece, PieceIndex, PublicKey, SegmentHeader, SegmentIndex,
     SlotNumber, Solution,
@@ -840,6 +840,13 @@ where
             .ready_chunks(OBJECT_MAPPING_BATCH_SIZE)
             .map(|objects| GlobalObjectMapping::V0 { objects });
 
+        // TESTING ONLY, DO NOT MERGE
+        let fake_mapping = vec![GlobalObject::default(); 3];
+        let mapping_stream = stream::iter(fake_mapping)
+            .ready_chunks(OBJECT_MAPPING_BATCH_SIZE)
+            .map(|objects| GlobalObjectMapping::V0 { objects })
+            .chain(mapping_stream);
+
         self.subscription_executor.spawn(
             "subspace-archived-object-mappings-subscription",
             Some("rpc"),
@@ -887,7 +894,13 @@ where
             .flat_map(move |archived_segment_notification| {
                 let objects = archived_segment_notification
                     .archived_segment
-                    .global_object_mappings()
+                    .global_object_mappings();
+
+                // TESTING ONLY, DO NOT MERGE
+                let fake_mapping = vec![GlobalObject::default(); 3];
+                let objects = objects.chain(fake_mapping);
+
+                let objects = objects
                     .filter(|object| hashes.remove(&object.hash))
                     .collect::<Vec<_>>();
 
