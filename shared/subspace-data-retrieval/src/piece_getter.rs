@@ -62,20 +62,20 @@ where
 }
 
 #[async_trait]
-impl<T> DsnSyncPieceGetter for &T
+impl<T> ObjectPieceGetter for &T
 where
-    T: DsnSyncPieceGetter + Send + Sync + ?Sized,
+    T: ObjectPieceGetter + Send + Sync + ?Sized,
 {
     async fn get_piece(&self, piece_index: PieceIndex) -> Result<Option<Piece>, BoxError> {
-        (*self).get_piece(piece_index).await
+        (**self).get_piece(piece_index).await
     }
 }
 
 // Implementing for IntoIterator causes trait coherence errors, so we just implement for Vec
 #[async_trait]
-impl<T> DsnSyncPieceGetter for Vec<T>
+impl<T> ObjectPieceGetter for Vec<T>
 where
-    T: DsnSyncPieceGetter + Send + Sync,
+    T: ObjectPieceGetter + Send + Sync,
 {
     async fn get_piece(&self, piece_index: PieceIndex) -> Result<Option<Piece>, BoxError> {
         for provider in self.iter() {

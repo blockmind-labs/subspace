@@ -13065,6 +13065,7 @@ dependencies = [
  "static_assertions",
  "subspace-archiving",
  "subspace-core-primitives",
+ "subspace-data-retrieval",
  "subspace-erasure-coding",
  "subspace-networking",
  "subspace-proof-of-space",

@@ -109,6 +109,58 @@ impl From<Error> for ErrorObjectOwned {
     }
 }
 
+// TESTING ONLY, DO NOT MERGE
+/// Hex-encoded object data.
+#[derive(Clone, PartialEq, Eq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(into = "VerboseHexData")]
+pub struct HexData(pub Vec<u8>);
+
+impl std::fmt::Debug for HexData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(&self.0))
+    }
+}
+
+impl From<HexData> for VerboseHexData {
+    fn from(object: HexData) -> Self {
+        Self {
+            len: object.0.len(),
+            utf8: Self::summarise(String::from_utf8_lossy(&object.0).to_string()),
+            hex: Self::summarise(hex::encode(object.0)),
+        }
+    }
+}
+
+/// Lossy summary serialization of an object stored in the history of the blockchain
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, serde::Serialize)]
+pub struct VerboseHexData {
+    pub len: usize,
+    pub utf8: String,
+    pub hex: String,
+}
+
+impl VerboseHexData {
+    pub const MAX_SUMMARY_LEN: usize = 100;
+    pub fn summarise(s: String) -> String {
+        if s.len() > Self::MAX_SUMMARY_LEN + "...".len() {
+            let end_part = s
+                .chars()
+                .rev()
+                .take(Self::MAX_SUMMARY_LEN / 2)
+                .collect::<String>();
+            format!(
+                "{}...{}",
+                s.chars()
+                    .take(Self::MAX_SUMMARY_LEN / 2)
+                    .collect::<String>(),
+                end_part.chars().rev().collect::<String>()
+            )
+        } else {
+            s
+        }
+    }
+}
+
 /// Provides rpc methods for interacting with Subspace.
 #[rpc(client, server)]
 pub trait SubspaceRpcApi {
@@ -182,6 +234,12 @@ pub trait SubspaceRpcApi {
         item = GlobalObjectMapping,
     )]
     fn subscribe_filtered_object_mappings(&self, hashes: Vec<Blake3Hash>);
+
+    #[method(name = "subspace_fetchArchivedObjects")]
+    async fn fetch_archived_objects(
+        &self,
+        mappings: Vec<subspace_core_primitives::objects::GlobalObject>,
+    ) -> Result<Vec<Option<HexData>>, Error>;
 }
 
 #[derive(Default)]
@@ -212,6 +270,10 @@ impl CachedArchivedSegment {
 
     fn get(&self) -> Vec<Arc<NewArchivedSegment>> {
         self.0.values().map(Arc::clone).collect()
+    }
+
+    fn segment_indexes(&self) -> Vec<SegmentIndex> {
+        self.0.keys().cloned().collect()
     }
 }
 
@@ -244,6 +306,11 @@ where
     pub kzg: Kzg,
     /// Erasure coding instance
     pub erasure_coding: ErasureCoding,
+
+    // TESTING ONLY, DO NOT MERGE
+    /// DSN object piece getter
+    pub object_piece_getter:
+        Arc<dyn subspace_data_retrieval::piece_getter::ObjectPieceGetter + Send + Sync + 'static>,
 }
 
 /// Implements the [`SubspaceRpcApiServer`] trait for interacting with Subspace.
@@ -274,6 +341,7 @@ where
     erasure_coding: ErasureCoding,
     deny_unsafe: DenyUnsafe,
     _block: PhantomData<Block>,
+    object_fetcher: subspace_data_retrieval::object_fetcher::ObjectFetcher,
 }
 
 /// [`SubspaceRpc`] is used for notifying subscribers about arrival of new slots and for
@@ -329,9 +397,14 @@ where
             chain_constants,
             max_pieces_in_sector,
             kzg: config.kzg,
-            erasure_coding: config.erasure_coding,
+            erasure_coding: config.erasure_coding.clone(),
             deny_unsafe: config.deny_unsafe,
             _block: PhantomData,
+            object_fetcher: subspace_data_retrieval::object_fetcher::ObjectFetcher::new(
+                config.object_piece_getter,
+                config.erasure_coding,
+                None,
+            ),
         })
     }
 }
@@ -708,7 +781,7 @@ where
 
     // Note: this RPC uses the cached archived segment, which is only updated by archived segments subscriptions
     async fn piece(&self, requested_piece_index: PieceIndex) -> Result<Option<Piece>, Error> {
-        use subspace_data_retrieval::piece_getter::DsnSyncPieceGetter;
+        use subspace_data_retrieval::piece_getter::ObjectPieceGetter;
 
         self.deny_unsafe.check_if_safe()?;
 
@@ -948,5 +1021,113 @@ where
             Some("rpc"),
             pipe_from_stream(pending, mapping_stream).boxed(),
         );
+    }
+
+    // TESTING ONLY, DO NOT MERGE
+    async fn fetch_archived_objects(
+        &self,
+        mappings: Vec<subspace_core_primitives::objects::GlobalObject>,
+    ) -> Result<Vec<Option<HexData>>, Error> {
+        self.deny_unsafe.check_if_safe()?;
+
+        let mut last_error = None;
+
+        let (archived_segments, segment_indexes) = {
+            let cache = self.cached_archived_segment.lock();
+            (cache.get(), cache.segment_indexes())
+        };
+
+        if archived_segments.is_empty() {
+            tracing::warn!("No cached segments to fetch objects from");
+        }
+
+        let cached_object_fetcher = subspace_data_retrieval::object_fetcher::ObjectFetcher::new(
+            Arc::new(archived_segments),
+            self.erasure_coding.clone(),
+            None,
+        );
+
+        let mut objects = Vec::with_capacity(mappings.len());
+        for mapping in &mappings {
+            match cached_object_fetcher
+                .fetch_object(mapping.piece_index, mapping.offset)
+                .await
+            {
+                Ok(object) => {
+                    tracing::info!(
+                        ?mapping,
+                        len = %object.len(),
+                        ?segment_indexes,
+                        first_piece_index = ?segment_indexes.first().map(|segment_index| segment_index.first_piece_index()),
+                        last_piece_index = ?segment_indexes.last().map(|segment_index| segment_index.last_piece_index()),
+                        "Fetched object from cached segments",
+                    );
+                    objects.push(Some(HexData(object)));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?mapping,
+                        first_piece_index = ?segment_indexes.first().map(|segment_index| segment_index.first_piece_index()),
+                        last_piece_index = ?segment_indexes.last().map(|segment_index| segment_index.last_piece_index()),
+                        "Failed to fetch object from cached segments: {}",
+                        error
+                    );
+
+                    let object = self
+                        .object_fetcher
+                        .fetch_object(mapping.piece_index, mapping.offset)
+                        .await
+                        .inspect_err(|error| {
+                            error!(
+                                "Failed to fetch object from local cache or network: {}",
+                                error
+                            );
+                        });
+
+                    match object {
+                        Ok(object) => {
+                            tracing::info!(
+                                ?mapping,
+                                len = %object.len(),
+                                "Fetched object from local cache or network",
+                            );
+                            objects.push(Some(HexData(object)));
+                        }
+                        Err(error) => {
+                            last_error = Some(Error::StringError(format!(
+                                "Failed to fetch object from local cache or network: {error:?}"
+                            )));
+                            objects.push(None);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (mapping, object) in mappings.iter().zip(objects.iter()) {
+            if let Some(object) = object {
+                let hash = subspace_core_primitives::crypto::blake3_hash_parallel(&object.0);
+                if hash != mapping.hash {
+                    // TODO: remove the full object data (`object`) from the logs, replace it with a summary?
+                    tracing::error!(
+                        ?mapping,
+                        object_hash = ?hash,
+                        ?object,
+                        "Fetched object data hash does not match expected hash"
+                    );
+                    last_error = Some(Error::StringError(format!(
+                        "Fetched object data hash: {hash:?} does not match expected hash: {mapping:?}, object: {object:?}"
+                    )));
+                }
+            }
+        }
+
+        if objects.iter().all(Option::is_none) {
+            Err(Error::StringError(format!(
+                "No objects available, last error: {last_error:?}"
+            )))
+        } else {
+            Ok(objects)
+        }
     }
 }

@@ -86,6 +86,50 @@ where
     pub erasure_coding: ErasureCoding,
     /// Backend used by the node.
     pub backend: Arc<B>,
+
+    // TESTING ONLY, DO NOT MERGE
+    /// DSN object piece getter
+    pub object_piece_getter:
+        Arc<dyn subspace_data_retrieval::piece_getter::ObjectPieceGetter + Send + Sync + 'static>,
+}
+
+// TESTING ONLY, DO NOT MERGE
+/// A wrapper for implementing `ObjectPieceGetter` on `PieceProvider`.
+#[derive(Debug)]
+pub struct PieceProviderObjectPieceGetter(
+    pub  subspace_networking::utils::piece_provider::PieceProvider<
+        subspace_networking::utils::piece_provider::NoPieceValidator,
+    >,
+);
+
+#[async_trait::async_trait]
+impl subspace_data_retrieval::piece_getter::ObjectPieceGetter for PieceProviderObjectPieceGetter {
+    async fn get_piece(
+        &self,
+        piece_index: subspace_core_primitives::PieceIndex,
+    ) -> Result<
+        Option<subspace_core_primitives::Piece>,
+        subspace_data_retrieval::piece_getter::BoxError,
+    > {
+        if let Some(piece) = self.0.get_piece_from_cache(piece_index).await {
+            return Ok(Some(piece));
+        }
+
+        // Copied from subspace_farmer::farmer_piece_getter::MAX_RANDOM_WALK_ROUNDS
+        const MAX_RANDOM_WALK_ROUNDS: usize = 15;
+        if let Some(piece) = self
+            .0
+            .get_piece_from_archival_storage(piece_index, MAX_RANDOM_WALK_ROUNDS)
+            .await
+        {
+            return Ok(Some(piece));
+        }
+
+        Err(
+            subspace_data_retrieval::piece_getter::PieceGetterError::NotFound { piece_index }
+                .into(),
+        )
+    }
 }
 
 /// Instantiate all full RPC extensions.
@@ -128,6 +172,7 @@ where
         kzg,
         erasure_coding,
         backend,
+        object_piece_getter,
     } = deps;
 
     let chain_name = chain_spec.name().to_string();
@@ -151,6 +196,7 @@ where
             kzg,
             erasure_coding,
             deny_unsafe,
+            object_piece_getter,
         })?
         .into_rpc(),
     )?;

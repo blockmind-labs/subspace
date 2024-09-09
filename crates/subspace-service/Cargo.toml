@@ -99,6 +99,9 @@ sp-session = { git = "https://github.com/subspace/polkadot-sdk", rev = "5626154d
 frame-system-rpc-runtime-api = { git = "https://github.com/subspace/polkadot-sdk", rev = "5626154d0781ac9a6ffd5a6207ed237f425ae631" }
 pallet-transaction-payment-rpc-runtime-api = { git = "https://github.com/subspace/polkadot-sdk", rev = "5626154d0781ac9a6ffd5a6207ed237f425ae631" }
 
+# TESTING ONLY, DO NOT MERGE
+subspace-data-retrieval = { version = "0.1.0", path = "../../shared/subspace-data-retrieval" }
+
 [features]
 runtime-benchmarks = [
     "dep:frame-benchmarking",

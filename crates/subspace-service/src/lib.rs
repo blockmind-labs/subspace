@@ -1217,6 +1217,12 @@ where
     // We replace the Substrate implementation of metrics server with our own.
     config.base.prometheus_config.take();
 
+    // TESTING ONLY, DO NOT MERGE
+    let object_piece_getter = Arc::new(rpc::PieceProviderObjectPieceGetter(PieceProvider::new(
+        node.clone(),
+        Some(subspace_networking::utils::piece_provider::NoPieceValidator),
+    )));
+
     let rpc_handlers = task_spawner::spawn_tasks(SpawnTasksParams {
         network: network_service.clone(),
         client: client.clone(),
@@ -1249,6 +1255,7 @@ where
                     kzg: subspace_link.kzg().clone(),
                     erasure_coding: subspace_link.erasure_coding().clone(),
                     backend: backend.clone(),
+                    object_piece_getter: object_piece_getter.clone(),
                 };
 
                 rpc::create_full(deps).map_err(Into::into)
