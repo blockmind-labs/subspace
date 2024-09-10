@@ -50,7 +50,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 use subspace_archiving::archiver::NewArchivedSegment;
 use subspace_core_primitives::crypto::kzg::Kzg;
@@ -155,8 +155,8 @@ pub trait SubspaceRpcApi {
         segment_indexes: Vec<SegmentIndex>,
     ) -> Result<Vec<Option<SegmentHeader>>, Error>;
 
-    #[method(name = "subspace_piece", blocking)]
-    fn piece(&self, piece_index: PieceIndex) -> Result<Option<Piece>, Error>;
+    #[method(name = "subspace_piece")]
+    async fn piece(&self, piece_index: PieceIndex) -> Result<Option<Piece>, Error>;
 
     #[method(name = "subspace_acknowledgeArchivedSegmentHeader")]
     async fn acknowledge_archived_segment_header(
@@ -201,18 +201,17 @@ struct BlockSignatureSenders {
 ///
 /// We store weak reference, such that archived segment is not persisted for longer than
 /// necessary occupying RAM.
-enum CachedArchivedSegment {
-    /// Special case for genesis segment when requested over RPC
-    Genesis(Arc<NewArchivedSegment>),
-    Weak(Weak<NewArchivedSegment>),
-}
+#[derive(Default, Debug)]
+struct CachedArchivedSegment(std::collections::BTreeMap<SegmentIndex, Arc<NewArchivedSegment>>);
 
 impl CachedArchivedSegment {
-    fn get(&self) -> Option<Arc<NewArchivedSegment>> {
-        match self {
-            CachedArchivedSegment::Genesis(archived_segment) => Some(Arc::clone(archived_segment)),
-            CachedArchivedSegment::Weak(weak_archived_segment) => weak_archived_segment.upgrade(),
-        }
+    fn insert(&mut self, segment: Arc<NewArchivedSegment>) {
+        self.0
+            .insert(segment.segment_header.segment_index(), segment);
+    }
+
+    fn get(&self) -> Vec<Arc<NewArchivedSegment>> {
+        self.0.values().map(Arc::clone).collect()
     }
 }
 
@@ -263,7 +262,7 @@ where
     reward_signature_senders: Arc<Mutex<BlockSignatureSenders>>,
     dsn_bootstrap_nodes: Vec<Multiaddr>,
     segment_headers_store: SegmentHeadersStore<AS>,
-    cached_archived_segment: Arc<Mutex<Option<CachedArchivedSegment>>>,
+    cached_archived_segment: Arc<Mutex<CachedArchivedSegment>>,
     archived_segment_acknowledgement_senders:
         Arc<Mutex<ArchivedSegmentHeaderAcknowledgementSenders>>,
     next_subscription_id: AtomicU64,
@@ -635,9 +634,7 @@ where
 
                     cached_archived_segment
                         .lock()
-                        .replace(CachedArchivedSegment::Weak(Arc::downgrade(
-                            &archived_segment,
-                        )));
+                        .insert(archived_segment.clone());
 
                     maybe_archived_segment_header
                 } else {
@@ -710,61 +707,79 @@ where
     }
 
     // Note: this RPC uses the cached archived segment, which is only updated by archived segments subscriptions
-    fn piece(&self, requested_piece_index: PieceIndex) -> Result<Option<Piece>, Error> {
+    async fn piece(&self, requested_piece_index: PieceIndex) -> Result<Option<Piece>, Error> {
+        use subspace_data_retrieval::piece_getter::DsnSyncPieceGetter;
+
         self.deny_unsafe.check_if_safe()?;
 
-        let archived_segment = {
-            let mut cached_archived_segment = self.cached_archived_segment.lock();
+        let cached_archive_segments = {
+            let cached_archived_segments = self.cached_archived_segment.lock().get();
 
-            match cached_archived_segment
-                .as_ref()
-                .and_then(CachedArchivedSegment::get)
+            match cached_archived_segments
+                .get_piece(requested_piece_index)
+                .await
             {
-                Some(archived_segment) => archived_segment,
-                None => {
+                Ok(Some(piece)) => return Ok(Some(piece)),
+                Ok(None) | Err(_) => {
                     if requested_piece_index > SegmentIndex::ZERO.last_piece_index() {
                         return Ok(None);
                     }
 
+                    // TODO: handle multiple requests recreating the genesis segment at the same time
                     debug!(%requested_piece_index, "Re-creating genesis segment on demand");
 
                     // Try to re-create genesis segment on demand
-                    match recreate_genesis_segment(
-                        &*self.client,
-                        self.kzg.clone(),
-                        self.erasure_coding.clone(),
-                    ) {
-                        Ok(Some(archived_segment)) => {
-                            let archived_segment = Arc::new(archived_segment);
-                            cached_archived_segment.replace(CachedArchivedSegment::Genesis(
-                                Arc::clone(&archived_segment),
-                            ));
-                            archived_segment
+                    let client = self.client.clone();
+                    let kzg = self.kzg.clone();
+                    let erasure_coding = self.erasure_coding.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        recreate_genesis_segment(&*client, kzg, erasure_coding)
+                            .map_err(|_error| "genesis segment recreation failed")
+                    })
+                    .await
+                    {
+                        Ok(Ok(Some(archived_segment))) => {
+                            let mut cached_archived_segments = self.cached_archived_segment.lock();
+
+                            let archived_segment = Arc::<NewArchivedSegment>::new(archived_segment);
+                            cached_archived_segments.insert(archived_segment.clone());
+                            cached_archived_segments.get()
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             return Ok(None);
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             error!(%error, "Failed to re-create genesis segment");
 
                             return Err(Error::StringError(
                                 "Failed to re-create genesis segment".to_string(),
                             ));
                         }
+                        Err(join_error) => match join_error.try_into_panic() {
+                            Ok(panic) => {
+                                std::panic::resume_unwind(panic);
+                            }
+                            Err(cancelled) => {
+                                error!(%cancelled, "Task re-creating the genesis segment was cancelled");
+                                return Err(Error::StringError(
+                                        format!("Task re-creating the genesis segment was cancelled: {cancelled}"),
+                                    ));
+                            }
+                        },
                     }
                 }
             }
         };
 
-        if requested_piece_index.segment_index() == archived_segment.segment_header.segment_index()
-        {
-            return Ok(archived_segment
-                .pieces
-                .pieces()
-                .nth(requested_piece_index.position() as usize));
-        }
-
-        Ok(None)
+        cached_archive_segments
+            .get_piece(requested_piece_index)
+            .await
+            .map_err(|error| {
+                error!(%error, "Failed to get piece from cached archived segments");
+                Error::StringError(format!(
+                    "Failed to get piece from cached archived segments: {error:?}"
+                ))
+            })
     }
 
     async fn segment_headers(
@@ -824,16 +839,23 @@ where
     fn subscribe_archived_object_mappings(&self, pending: PendingSubscriptionSink) {
         // TODO: deny unsafe subscriptions?
 
+        let cached_archived_segment = Arc::clone(&self.cached_archived_segment);
+
         // The genesis segment isn't included in this stream. In other methods we recreate is as the first segment,
         // but there aren't any mappings in it, so we don't need to recreate it as part of this subscription.
 
         let mapping_stream = self
             .archived_segment_notification_stream
             .subscribe()
-            .flat_map(|archived_segment_notification| {
+            .flat_map(move |archived_segment_notification| {
                 let objects = archived_segment_notification
                     .archived_segment
                     .global_object_mappings();
+
+                // TESTING ONLY, DO NOT MERGE
+                cached_archived_segment
+                    .lock()
+                    .insert(archived_segment_notification.archived_segment.clone());
 
                 stream::iter(objects)
             })
@@ -886,6 +908,8 @@ where
         let mut hashes = HashSet::<Blake3Hash>::from_iter(hashes);
         let hash_count = hashes.len();
 
+        let cached_archived_segment = Arc::clone(&self.cached_archived_segment);
+
         // The genesis segment isn't included in this stream, see
         // `subscribe_archived_object_mappings` for details.
         let mapping_stream = self
@@ -895,6 +919,11 @@ where
                 let objects = archived_segment_notification
                     .archived_segment
                     .global_object_mappings();
+
+                // TESTING ONLY, DO NOT MERGE
+                cached_archived_segment
+                    .lock()
+                    .insert(archived_segment_notification.archived_segment.clone());
 
                 // TESTING ONLY, DO NOT MERGE
                 let fake_mapping = vec![GlobalObject::default(); 3];

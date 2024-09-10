@@ -61,6 +61,33 @@ where
     }
 }
 
+#[async_trait]
+impl<T> DsnSyncPieceGetter for &T
+where
+    T: DsnSyncPieceGetter + Send + Sync + ?Sized,
+{
+    async fn get_piece(&self, piece_index: PieceIndex) -> Result<Option<Piece>, BoxError> {
+        (*self).get_piece(piece_index).await
+    }
+}
+
+// Implementing for IntoIterator causes trait coherence errors, so we just implement for Vec
+#[async_trait]
+impl<T> DsnSyncPieceGetter for Vec<T>
+where
+    T: DsnSyncPieceGetter + Send + Sync,
+{
+    async fn get_piece(&self, piece_index: PieceIndex) -> Result<Option<Piece>, BoxError> {
+        for provider in self.iter() {
+            if let Ok(Some(piece)) = provider.get_piece(piece_index).await {
+                return Ok(Some(piece));
+            }
+        }
+
+        Err(PieceGetterError::NotFound { piece_index }.into())
+    }
+}
+
 // Convenience methods, mainly used in testing
 #[async_trait]
 impl ObjectPieceGetter for NewArchivedSegment {

@@ -39,3 +39,9 @@ subspace-networking = { version = "0.1.0", path = "../subspace-networking" }
 subspace-rpc-primitives = { version = "0.1.0", path = "../subspace-rpc-primitives" }
 thiserror = "1.0.63"
 tracing = "0.1.40"
+
+# TESTING ONLY, DO NOT MERGE
+hex = "0.4.3"
+serde = "1.0.206"
+subspace-data-retrieval = { version = "0.1.0", path = "../../shared/subspace-data-retrieval" }
+tokio = { version = "1.39.2", features = ["parking_lot", "rt-multi-thread"] }
