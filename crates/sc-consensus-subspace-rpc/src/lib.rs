@@ -403,7 +403,7 @@ where
             object_fetcher: subspace_data_retrieval::object_fetcher::ObjectFetcher::new(
                 config.object_piece_getter,
                 config.erasure_coding,
-                None,
+                Some(5 * 1024 * 1024),
             ),
         })
     }
@@ -1044,7 +1044,7 @@ where
         let cached_object_fetcher = subspace_data_retrieval::object_fetcher::ObjectFetcher::new(
             Arc::new(archived_segments),
             self.erasure_coding.clone(),
-            None,
+            Some(5 * 1024 * 1024),
         );
 
         let mut objects = Vec::with_capacity(mappings.len());
