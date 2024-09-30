@@ -948,36 +948,8 @@ pub type EpochIndex = u32;
 /// Type representing operator ID
 pub type OperatorId = u64;
 
-/// Staking specific hold identifier
-#[derive(
-    PartialEq, Eq, Clone, Encode, Decode, TypeInfo, MaxEncodedLen, Ord, PartialOrd, Copy, Debug,
-)]
-pub enum StakingHoldIdentifier {
-    /// Holds all the currently staked funds to an Operator.
-    Staked(OperatorId),
-}
-
 /// Channel identity.
 pub type ChannelId = sp_core::U256;
-
-/// Messenger specific hold identifier
-#[derive(
-    PartialEq, Eq, Clone, Encode, Decode, TypeInfo, MaxEncodedLen, Ord, PartialOrd, Copy, Debug,
-)]
-pub enum MessengerHoldIdentifier {
-    /// Holds the current reserved balance for channel opening
-    Channel((ChainId, ChannelId)),
-}
-
-/// Domains specific Identifier for Balances holds.
-#[derive(
-    PartialEq, Eq, Clone, Encode, Decode, TypeInfo, MaxEncodedLen, Ord, PartialOrd, Copy, Debug,
-)]
-pub enum DomainsHoldIdentifier {
-    Staking(StakingHoldIdentifier),
-    DomainInstantiation(DomainId),
-    StorageFund(OperatorId),
-}
 
 /// Domains specific digest item.
 #[derive(PartialEq, Eq, Clone, Encode, Decode, TypeInfo)]
@@ -1096,14 +1068,6 @@ pub fn self_domain_id_storage_key() -> StorageKey {
 pub struct DomainInstanceData {
     pub runtime_type: RuntimeType,
     pub raw_genesis: RawGenesis,
-}
-
-#[derive(Debug, Decode, Encode, TypeInfo, Clone)]
-pub struct DomainBlockLimit {
-    /// The max block size for the domain.
-    pub max_block_size: u32,
-    /// The max block weight for the domain.
-    pub max_block_weight: Weight,
 }
 
 #[derive(Debug, Decode, Encode, TypeInfo, Clone)]
@@ -1444,6 +1408,7 @@ impl DomainAllowlistUpdates {
 }
 
 /// Domain Sudo runtime call.
+///
 /// This structure exists because we need to generate a storage proof for FP
 /// and Storage shouldn't be None. So each domain must always hold this value even if
 /// there is an empty runtime call inside
@@ -1506,7 +1471,6 @@ impl<Balance> OnChainRewards<Balance> for () {
 
 sp_api::decl_runtime_apis! {
     /// API necessary for domains pallet.
-    #[api_version(6)]
     pub trait DomainsApi<DomainHeader: HeaderT> {
         /// Submits the transaction bundle via an unsigned extrinsic.
         fn submit_bundle_unsigned(opaque_bundle: OpaqueBundle<NumberFor<Block>, Block::Hash, DomainHeader, Balance>);
@@ -1519,15 +1483,6 @@ sp_api::decl_runtime_apis! {
             domain_id: DomainId,
             extrinsics: Vec<Block::Extrinsic>,
         ) -> OpaqueBundles<Block, DomainHeader, Balance>;
-
-        /// Extract bundle from the extrinsic if the extrinsic is `submit_bundle`.
-        fn extract_bundle(extrinsic: Block::Extrinsic) -> Option<OpaqueBundle<NumberFor<Block>, Block::Hash, DomainHeader, Balance>>;
-
-        /// Extract the execution receipt stored successfully from the given extrinsics.
-        fn extract_receipts(
-            domain_id: DomainId,
-            extrinsics: Vec<Block::Extrinsic>,
-        ) -> Vec<ExecutionReceiptFor<DomainHeader, Block, Balance>>;
 
         /// Generates a randomness seed for extrinsics shuffling.
         fn extrinsics_shuffling_seed() -> Randomness;
@@ -1555,9 +1510,6 @@ sp_api::decl_runtime_apis! {
 
         /// Returns the block number of oldest unconfirmed execution receipt.
         fn oldest_unconfirmed_receipt_number(domain_id: DomainId) -> Option<HeaderNumberFor<DomainHeader>>;
-
-        /// Returns the domain block limit of the given domain.
-        fn domain_block_limit(domain_id: DomainId) -> Option<DomainBlockLimit>;
 
         /// Returns the domain bundle limit of the given domain.
         fn domain_bundle_limit(domain_id: DomainId) -> Option<DomainBundleLimit>;
