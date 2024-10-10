@@ -27,7 +27,7 @@ env:
 
 jobs:
   cargo-fmt:
-    runs-on: ${{ fromJson(github.repository_owner == 'autonomys' && '["self-hosted, linux, x64, ubuntu-22-04"]' || '"ubuntu-22.04"') }}
+    runs-on: ${{ github.repository_owner == 'autonomys' && 'self-hosted-ephemeral, linux, x64, ubuntu-22-04' || 'ubuntu-22.04' }}
 
     steps:
       - name: Checkout
@@ -54,7 +54,7 @@ jobs:
   cargo-clippy:
     strategy:
       matrix:
-        os: ${{ fromJson(github.repository_owner == 'autonomys' && '["self-hosted, linux, x64, ubuntu-22-04"]' || '"ubuntu-22.04"') }}
+        os: ${{ github.repository_owner == 'autonomys' && 'self-hosted-ephemeral, linux, x64, ubuntu-22-04' || 'ubuntu-22.04' }}
 
     runs-on: ${{ matrix.os }}
 
@@ -167,7 +167,7 @@ jobs:
         if: runner.os == 'Windows'
 
   cargo-docs:
-    runs-on: ${{ fromJson(github.repository_owner == 'autonomys' && '["self-hosted, linux, x64, ubuntu-22-04"]' || '"ubuntu-22.04"') }}
+    runs-on: ${{ github.repository_owner == 'autonomys' && 'self-hosted-ephemeral, linux, x64, ubuntu-22-04' || 'ubuntu-22.04' }}
     steps:
       - name: Checkout
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
@@ -195,7 +195,7 @@ jobs:
   cargo-test:
     strategy:
       matrix:
-        os: ${{ fromJson(github.repository_owner == 'autonomys' && '["self-hosted, linux, x64, ubuntu-22-04"]' || '"ubuntu-22.04"') }}
+        os: ${{ github.repository_owner == 'autonomys' && fromJson('["self-hosted-ephemeral, linux, x64, ubuntu-latest"]') || '["ubuntu-latest"]' }}
 
     runs-on: ${{ matrix.os }}
 
