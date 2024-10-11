@@ -27,7 +27,8 @@ env:
 
 jobs:
   cargo-fmt:
-    runs-on: ${{ github.repository_owner == 'autonomys' && 'self-hosted-ephemeral, linux, x64, ubuntu-22-04' || 'ubuntu-22.04' }}
+    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
+    if: github.repository_owner == 'autonomys'
 
     steps:
       - name: Checkout
@@ -52,11 +53,8 @@ jobs:
         run: cargo fmt --all -- --check
 
   cargo-clippy:
-    strategy:
-      matrix:
-        os: ${{ github.repository_owner == 'autonomys' && 'self-hosted-ephemeral, linux, x64, ubuntu-22-04' || 'ubuntu-22.04' }}
-
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
+    if: github.repository_owner == 'autonomys'
 
     steps:
       - name: Checkout
@@ -167,7 +165,8 @@ jobs:
         if: runner.os == 'Windows'
 
   cargo-docs:
-    runs-on: ${{ github.repository_owner == 'autonomys' && 'self-hosted-ephemeral, linux, x64, ubuntu-22-04' || 'ubuntu-22.04' }}
+    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
+    if: github.repository_owner == 'autonomys'
     steps:
       - name: Checkout
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
@@ -193,11 +192,8 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken-intra-doc-links -D rustdoc::private_intra_doc_links"
 
   cargo-test:
-    strategy:
-      matrix:
-        os: ${{ github.repository_owner == 'autonomys' && fromJson('["self-hosted-ephemeral, linux, x64, ubuntu-latest"]') || '["ubuntu-latest"]' }}
-
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
+    if: github.repository_owner == 'autonomys'
 
     steps:
       - name: Checkout
