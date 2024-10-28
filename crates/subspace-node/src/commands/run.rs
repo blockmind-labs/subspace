@@ -24,10 +24,16 @@ use sc_utils::mpsc::tracing_unbounded;
 use sp_core::traits::SpawnEssentialNamed;
 use sp_messenger::messages::ChainId;
 use std::env;
+use std::time::Duration;
 use subspace_metrics::{start_prometheus_metrics_server, RegistryAdapter};
 use subspace_runtime::{Block, RuntimeApi};
 use subspace_service::config::ChainSyncMode;
+use tokio::runtime::Builder;
 use tracing::{debug, error, info, info_span, warn};
+
+/// During shutdown, the amount of time the tokio runtime will wait for async tasks to yield, or
+/// `spawn_blocking()` tasks to complete, before exiting the process.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Options for running a node
 #[derive(Debug, Parser)]
@@ -68,11 +74,27 @@ fn raise_fd_limit() {
 }
 
 /// Default run command for node
-#[tokio::main]
-pub async fn run(run_options: RunOptions) -> Result<(), Error> {
+pub fn run(run_options: RunOptions) -> Result<(), Error> {
     init_logger();
     raise_fd_limit();
 
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::TokioRuntime)?;
+
+    runtime.block_on(tokio_run(run_options))?;
+
+    // Usually tasks finish within a few seconds, but if a task is slow, let the user know what
+    // we're waiting for.
+    info!("Waiting for running tasks to finish...");
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+
+    Ok(())
+}
+
+/// The "run" future that tokio blocks on.
+pub async fn tokio_run(run_options: RunOptions) -> Result<(), Error> {
     let signals = Signals::capture()?;
 
     let RunOptions {

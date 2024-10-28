@@ -12,9 +12,11 @@ mod utils;
 use clap::Parser;
 use std::path::PathBuf;
 use std::process::exit;
+use std::time::Duration;
 use std::{fs, panic};
 use subspace_farmer::single_disk_farm::{ScrubTarget, SingleDiskFarm};
 use subspace_proof_of_space::chia::ChiaTable;
+use tokio::runtime::Builder;
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
@@ -22,6 +24,10 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// During shutdown, the amount of time the tokio runtime will wait for async tasks to yield, or
+/// `spawn_blocking()` tasks to complete, before exiting the process.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 type PosTable = ChiaTable;
 
@@ -73,8 +79,7 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Exit on panics, rather than unwinding. Unwinding can hang the tokio runtime waiting for
     // stuck tasks or threads.
     let default_panic_hook = panic::take_hook();
@@ -102,6 +107,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
     utils::raise_fd_limit();
 
+    // TODO: consider only using the executor for commands which run async code.
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+
+    runtime.block_on(tokio_main())?;
+
+    // Usually tasks finish within a few seconds, but if a task is slow, let the user know what
+    // we're waiting for.
+    info!("Waiting for running tasks to finish...");
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+
+    Ok(())
+}
+
+/// The main future that's run by tokio.
+async fn tokio_main() -> anyhow::Result<()> {
     let command = Command::parse();
 
     match command {

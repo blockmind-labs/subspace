@@ -15,9 +15,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::panic;
 use std::process::exit;
 use std::sync::Arc;
+use std::time::Duration;
 use subspace_metrics::{start_prometheus_metrics_server, RegistryAdapter};
 use subspace_networking::libp2p::multiaddr::Protocol;
 use subspace_networking::{peer_id, Config, KademliaMode};
+use tokio::runtime::Builder;
 use tracing::{debug, info, Level};
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -25,6 +27,10 @@ use tracing_subscriber::EnvFilter;
 
 /// Size of the LRU cache for peers.
 pub const KNOWN_PEERS_CACHE_SIZE: u32 = 10000;
+
+/// During shutdown, the amount of time the tokio runtime will wait for async tasks to yield, or
+/// `spawn_blocking()` tasks to complete, before exiting the process.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Parser)]
 #[clap(about, version)]
@@ -117,7 +123,7 @@ fn set_exit_on_panic() {
     }));
 }
 
-fn init_logging() {
+fn init_logger() {
     // set default log to info if the RUST_LOG is not set.
     let env_filter = EnvFilter::builder()
         .with_default_directive(Level::INFO.into())
@@ -128,11 +134,25 @@ fn init_logging() {
     builder.init()
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     set_exit_on_panic();
-    init_logging();
+    init_logger();
 
+    // TODO: consider only using the executor for commands which run async code.
+    let runtime = Builder::new_multi_thread().enable_all().build()?;
+
+    runtime.block_on(tokio_main())?;
+
+    // Usually tasks finish within a few seconds, but if a task is slow, let the user know what
+    // we're waiting for.
+    info!("Waiting for running tasks to finish...");
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+
+    Ok(())
+}
+
+/// The main future that's run by tokio.
+async fn tokio_main() -> Result<(), Box<dyn Error>> {
     let command: Command = Command::parse();
 
     match command {

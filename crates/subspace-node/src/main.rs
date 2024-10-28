@@ -42,6 +42,7 @@ use sp_runtime::traits::HashingFor;
 use subspace_proof_of_space::chia::ChiaTable;
 use subspace_runtime::{Block, RuntimeApi};
 use subspace_service::HostFunctions;
+use tokio::io;
 use tracing::warn;
 
 #[global_allocator]
@@ -63,6 +64,10 @@ pub enum Error {
     /// Substrate service error.
     #[error(transparent)]
     SubstrateService(#[from] sc_service::Error),
+
+    /// Tokio runtime error.
+    #[error("Building the tokio runtime failed: {0}")]
+    TokioRuntime(io::Error),
 
     /// Other kind of error.
     #[error("Other: {0}")]
