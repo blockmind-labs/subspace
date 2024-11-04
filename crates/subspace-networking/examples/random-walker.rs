@@ -1,9 +1,3 @@
-// TODO: Remove
-#![allow(
-    clippy::needless_return,
-    reason = "https://github.com/rust-lang/rust-clippy/issues/13458"
-)]
-
 use clap::Parser;
 use futures::channel::oneshot;
 use futures::future::pending;
@@ -37,10 +31,10 @@ struct Args {
     /// production use.
     #[arg(long, required = true)]
     protocol_version: String,
-    /// Defines max established outgoing connections limit for the peer.
+    /// Maximum established outgoing connections limit for the peer.
     #[arg(long, default_value_t = 100)]
     out_peers: u32,
-    /// Defines max pending outgoing connections limit for the peer.
+    /// Maximum pending outgoing connections limit for the peer.
     #[arg(long, default_value_t = 100)]
     pending_out_peers: u32,
     /// Enable piece retrieval retries on unsuccessful requests.
@@ -329,9 +323,10 @@ async fn request_sample_piece(
     let request_result = node
         .send_generic_request(
             peer_id,
+            Vec::new(),
             PieceByIndexRequest {
                 piece_index: sample_piece_index,
-                cached_pieces: Vec::new(),
+                cached_pieces: Arc::default(),
             },
         )
         .await;

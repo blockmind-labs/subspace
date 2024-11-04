@@ -38,16 +38,14 @@ use tracing::{debug, error, info, warn, Instrument};
 ///
 /// Must be the same as RPC limit since all requests go to the node anyway.
 const SEGMENT_HEADERS_LIMIT: u32 = MAX_SEGMENT_HEADERS_PER_REQUEST as u32;
-/// Max number of cached pieces to accept per request
-const MAX_CACHED_PIECES: usize = 128;
 
 /// Configuration for network stack
 #[derive(Debug, Parser)]
 pub(in super::super) struct NetworkArgs {
     /// Multiaddrs of bootstrap nodes to connect to on startup, multiple are supported
-    #[arg(long)]
+    #[arg(long = "bootstrap-node")]
     pub(in super::super) bootstrap_nodes: Vec<Multiaddr>,
-    /// Multiaddr to listen on for subspace networking, for instance `/ip4/0.0.0.0/tcp/0`,
+    /// Multiaddrs to listen on for subspace networking, for instance `/ip4/0.0.0.0/tcp/0`,
     /// multiple are supported.
     #[arg(long, default_values_t = [
         Multiaddr::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
@@ -56,26 +54,26 @@ pub(in super::super) struct NetworkArgs {
             .with(Protocol::Tcp(30533))
     ])]
     pub(in super::super) listen_on: Vec<Multiaddr>,
-    /// Determines whether we allow keeping non-global (private, shared, loopback..) addresses in
-    /// Kademlia DHT.
+    /// Enable non-global (private, shared, loopback..) addresses in Kademlia DHT.
+    /// By default, these addresses are excluded from the DHT.
     #[arg(long, default_value_t = false)]
     pub(in super::super) allow_private_ips: bool,
     /// Multiaddrs of reserved nodes to maintain a connection to, multiple are supported
     #[arg(long)]
     pub(in super::super) reserved_peers: Vec<Multiaddr>,
-    /// Defines max established incoming connection limit.
+    /// Maximum established incoming connection limit.
     #[arg(long, default_value_t = 300)]
     pub(in super::super) in_connections: u32,
-    /// Defines max established outgoing swarm connection limit.
+    /// Maximum established outgoing swarm connection limit.
     #[arg(long, default_value_t = 100)]
     pub(in super::super) out_connections: u32,
-    /// Defines max pending incoming connection limit.
+    /// Maximum pending incoming connection limit.
     #[arg(long, default_value_t = 100)]
     pub(in super::super) pending_in_connections: u32,
-    /// Defines max pending outgoing swarm connection limit.
+    /// Maximum pending outgoing swarm connection limit.
     #[arg(long, default_value_t = 100)]
     pub(in super::super) pending_out_connections: u32,
-    /// Known external addresses
+    /// Known external addresses.
     #[arg(long = "external-address")]
     pub(in super::super) external_addresses: Vec<Multiaddr>,
 }
@@ -140,17 +138,18 @@ where
                 CachedPieceByIndexRequestHandler::create(move |peer_id, request| {
                     let CachedPieceByIndexRequest {
                         piece_index,
-                        mut cached_pieces,
+                        cached_pieces,
                     } = request;
                     debug!(?piece_index, "Cached piece request received");
 
                     let maybe_weak_node = Arc::clone(&maybe_weak_node);
                     let farmer_cache = farmer_cache.clone();
+                    let mut cached_pieces = Arc::unwrap_or_clone(cached_pieces);
 
                     async move {
                         let piece_from_cache =
                             farmer_cache.get_piece(piece_index.to_multihash()).await;
-                        cached_pieces.truncate(MAX_CACHED_PIECES);
+                        cached_pieces.truncate(CachedPieceByIndexRequest::RECOMMENDED_LIMIT);
                         let cached_pieces = farmer_cache.has_pieces(cached_pieces).await;
 
                         Some(CachedPieceByIndexResponse {
@@ -189,16 +188,17 @@ where
             PieceByIndexRequestHandler::create(move |_, request| {
                 let PieceByIndexRequest {
                     piece_index,
-                    mut cached_pieces,
+                    cached_pieces,
                 } = request;
                 debug!(?piece_index, "Piece request received. Trying cache...");
 
                 let weak_plotted_pieces = weak_plotted_pieces.clone();
                 let farmer_cache = farmer_cache.clone();
+                let mut cached_pieces = Arc::unwrap_or_clone(cached_pieces);
 
                 async move {
                     let piece_from_cache = farmer_cache.get_piece(piece_index.to_multihash()).await;
-                    cached_pieces.truncate(MAX_CACHED_PIECES);
+                    cached_pieces.truncate(PieceByIndexRequest::RECOMMENDED_LIMIT);
                     let cached_pieces = farmer_cache.has_pieces(cached_pieces).await;
 
                     if let Some(piece) = piece_from_cache {
@@ -241,6 +241,8 @@ where
                 async move {
                     let internal_result = match req {
                         SegmentHeaderRequest::SegmentIndexes { segment_indexes } => {
+                            let segment_indexes = Arc::unwrap_or_clone(segment_indexes);
+
                             if segment_indexes.len() > SEGMENT_HEADERS_LIMIT as usize {
                                 debug!(
                                     "segment_indexes length exceed the limit: {} ",

@@ -1,9 +1,3 @@
-// TODO: Remove
-#![allow(
-    clippy::needless_return,
-    reason = "https://github.com/rust-lang/rust-clippy/issues/13458"
-)]
-
 mod consensus;
 mod domain;
 mod shared;
@@ -62,7 +56,7 @@ fn raise_fd_limit() {
             );
         }
         Ok(fdlimit::Outcome::Unsupported) => {
-            // Unsupported platform (non-Linux)
+            // Unsupported platform (a platform other than Linux or macOS)
         }
         Err(error) => {
             warn!(

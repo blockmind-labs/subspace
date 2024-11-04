@@ -1,9 +1,3 @@
-// TODO: Remove
-#![allow(
-    clippy::needless_return,
-    reason = "https://github.com/rust-lang/rust-clippy/issues/13458"
-)]
-
 use crate::protocols::reserved_peers::{Behaviour, Config};
 use futures::{select, FutureExt};
 use libp2p::core::transport::MemoryTransport;
@@ -19,7 +13,7 @@ use tokio::time::sleep;
 
 const DIALING_INTERVAL_IN_SECS: Duration = Duration::from_secs(1);
 
-#[tokio::test()]
+#[tokio::test]
 async fn test_connection_breaks_after_timeout_without_reservation() {
     let connection_timeout = Duration::from_millis(300);
     let long_delay = Duration::from_millis(1000);
@@ -63,7 +57,7 @@ async fn test_connection_breaks_after_timeout_without_reservation() {
     assert!(!peer2.is_connected(peer1.local_peer_id()));
 }
 
-#[tokio::test()]
+#[tokio::test]
 async fn test_connection_reservation() {
     let connection_timeout = Duration::from_millis(300);
     let long_delay = Duration::from_millis(1000);
@@ -111,7 +105,7 @@ async fn test_connection_reservation() {
     assert!(peer2.is_connected(peer1.local_peer_id()));
 }
 
-#[tokio::test()]
+#[tokio::test]
 async fn test_connection_reservation_symmetry() {
     let connection_timeout = Duration::from_millis(300);
     let long_delay = Duration::from_millis(1000);
@@ -157,7 +151,7 @@ async fn test_connection_reservation_symmetry() {
     assert!(!peer2.is_connected(peer1.local_peer_id()));
 }
 
-#[tokio::test()]
+#[tokio::test]
 async fn test_reserved_peers_dial_event() {
     let connection_timeout = Duration::from_millis(1300);
     let long_delay = Duration::from_millis(2000);

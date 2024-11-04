@@ -27,8 +27,7 @@ env:
 
 jobs:
   cargo-fmt:
-    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
-    if: github.repository_owner == 'autonomys'
+    runs-on: ${{ fromJson(github.repository_owner == 'autonomys' && '["self-hosted", "ubuntu-22.04-x86-64"]' || '"ubuntu-22.04"') }}
 
     steps:
       - name: Checkout
@@ -53,8 +52,9 @@ jobs:
         run: cargo fmt --all -- --check
 
   cargo-clippy:
-    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
-    if: github.repository_owner == 'autonomys'
+    strategy:
+      matrix:
+        os: ${{ fromJson(github.repository_owner == 'autonomys' && '[["self-hosted", "ubuntu-22.04-x86-64"], ["self-hosted", "macos-14-arm64"], ["self-hosted", "windows-server-2022-x86-64"]]' || '["ubuntu-22.04", "macos-14", "windows-2022"]') }}
 
     steps:
       - name: Checkout
@@ -88,12 +88,6 @@ jobs:
         run: brew install automake
         if: runner.os == 'macOS'
 
-      # Workaround to resolve link error with C:\msys64\mingw64\bin\libclang.dll
-      - name: Remove msys64
-        run: Remove-Item -LiteralPath "C:\msys64\" -Force -Recurse
-        # Doesn't exist on self-hosted runners
-        if: matrix.os == 'windows-2022'
-
       - name: CUDA toolchain
         uses: Jimver/cuda-toolkit@9b295696791d75d658d8de64c4a85097ad8abeaf # v0.2.16
         with:
@@ -115,8 +109,8 @@ jobs:
           ROCM_VERSION=6.2.2
           sudo mkdir -p --mode=0755 /etc/apt/keyrings
           curl -L https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION focal main" | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
-          echo "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" | sudo tee /etc/apt/preferences.d/rocm-pin-600 > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
+          echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" | sudo tee /etc/apt/preferences.d/rocm-pin-600 > /dev/null
           sudo apt-get update
           DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends rocm-hip-runtime-dev
           echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf > /dev/null
@@ -165,8 +159,7 @@ jobs:
         if: runner.os == 'Windows'
 
   cargo-docs:
-    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
-    if: github.repository_owner == 'autonomys'
+    runs-on: ${{ fromJson(github.repository_owner == 'autonomys' && '["self-hosted", "ubuntu-22.04-x86-64"]' || '"ubuntu-22.04"') }}
     steps:
       - name: Checkout
         uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
@@ -192,8 +185,13 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken-intra-doc-links -D rustdoc::private_intra_doc_links"
 
   cargo-test:
-    runs-on: [self-hosted-ephemeral, ubuntu-22-04]
-    if: github.repository_owner == 'autonomys'
+    strategy:
+      matrix:
+        os: ${{ fromJson(github.repository_owner == 'autonomys' && '[["self-hosted", "ubuntu-22.04-x86-64"], ["self-hosted", "macos-14-arm64"], ["self-hosted", "windows-server-2022-x86-64"]]' || '["ubuntu-22.04", "macos-14", "windows-2022"]') }}
+
+    runs-on: ${{ matrix.os }}
+    # Don't use the full 6 hours if a test hangs
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -226,12 +224,6 @@ jobs:
       - name: Install automake (macOS)
         run: brew install automake
         if: runner.os == 'macOS'
-
-      # Workaround to resolve link error with C:\msys64\mingw64\bin\libclang.dll
-      - name: Remove msys64
-        run: Remove-Item -LiteralPath "C:\msys64\" -Force -Recurse
-        # Doesn't exist on self-hosted runners
-        if: matrix.os == 'windows-2022'
 
       - name: Configure cache
         uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2

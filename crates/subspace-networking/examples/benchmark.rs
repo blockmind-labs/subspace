@@ -1,9 +1,3 @@
-// TODO: Remove
-#![allow(
-    clippy::needless_return,
-    reason = "https://github.com/rust-lang/rust-clippy/issues/13458"
-)]
-
 use backoff::future::retry;
 use backoff::ExponentialBackoff;
 use clap::Parser;
@@ -98,10 +92,10 @@ struct Args {
     /// production use.
     #[arg(long, required = true)]
     protocol_version: String,
-    /// Defines max established outgoing connections limit for the peer.
+    /// Maximum established outgoing connections limit for the peer.
     #[arg(long, default_value_t = 100)]
     out_peers: u32,
-    /// Defines max pending outgoing connections limit for the peer.
+    /// Maximum pending outgoing connections limit for the peer.
     #[arg(long, default_value_t = 100)]
     pending_out_peers: u32,
     #[clap(subcommand)]
@@ -220,7 +214,7 @@ async fn simple_benchmark(node: Node, max_pieces: usize, start_with: usize, retr
         return;
     }
 
-    let piece_provider = PieceProvider::<NoPieceValidator>::new(node, None);
+    let piece_provider = PieceProvider::new(node, NoPieceValidator);
     let mut total_duration = Duration::default();
     for i in start_with..(start_with + max_pieces) {
         let piece_index = PieceIndex::from(i as u64);
@@ -272,7 +266,7 @@ async fn parallel_benchmark(
 
     let semaphore = &Semaphore::new(parallelism_level.into());
 
-    let piece_provider = &PieceProvider::<NoPieceValidator>::new(node, None);
+    let piece_provider = &PieceProvider::new(node, NoPieceValidator);
     let mut total_duration = Duration::default();
     let mut pure_total_duration = Duration::default();
     let mut pending_pieces = (start_with..(start_with + max_pieces))

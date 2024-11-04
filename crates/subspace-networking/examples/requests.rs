@@ -1,9 +1,3 @@
-// TODO: Remove
-#![allow(
-    clippy::needless_return,
-    reason = "https://github.com/rust-lang/rust-clippy/issues/13458"
-)]
-
 use futures::channel::oneshot;
 use libp2p::multiaddr::Protocol;
 use parity_scale_codec::{Decode, Encode};
@@ -93,7 +87,7 @@ async fn main() {
 
     tokio::spawn(async move {
         let resp = node_2
-            .send_generic_request(node_1.id(), ExampleRequest)
+            .send_generic_request(node_1.id(), Vec::new(), ExampleRequest)
             .await
             .unwrap();
 

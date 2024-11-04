@@ -16,6 +16,7 @@ use futures::{stream, SinkExt, Stream, StreamExt};
 use parking_lot::Mutex;
 use prometheus_client::registry::Registry;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::{fs, io};
@@ -30,6 +31,8 @@ use tracing::{debug, info, warn};
 /// How many pieces should be skipped before stopping to check the rest of contents, this allows to
 /// not miss most of the pieces after one or two corrupted pieces
 const CONTENTS_READ_SKIP_LIMIT: usize = 3;
+/// How many piece to read from disk at the same time (using tokio thread pool)
+const PIECES_READING_CONCURRENCY: usize = 32;
 
 /// Disk piece cache open error
 #[derive(Debug, Error)]
@@ -57,9 +60,40 @@ pub enum DiskPieceCacheError {
 }
 
 #[derive(Debug)]
+struct FilePool {
+    files: Box<[DirectIoFile; PIECES_READING_CONCURRENCY]>,
+    cursor: AtomicU8,
+}
+
+impl FilePool {
+    fn open(path: &Path) -> io::Result<Self> {
+        let files = (0..PIECES_READING_CONCURRENCY)
+            .map(|_| DirectIoFile::open(path))
+            .collect::<Result<Box<_>, _>>()?
+            .try_into()
+            .expect("Statically correct length; qed");
+        Ok(Self {
+            files,
+            cursor: AtomicU8::new(0),
+        })
+    }
+
+    fn read(&self) -> &DirectIoFile {
+        let position = usize::from(self.cursor.fetch_add(1, Ordering::Relaxed));
+        &self.files[position % PIECES_READING_CONCURRENCY]
+    }
+
+    fn write(&self) -> &DirectIoFile {
+        // Always the same file or else overlapping writes will be corrupted due to
+        // read/modify/write internals, which are in turn caused by alignment requirements
+        &self.files[0]
+    }
+}
+
+#[derive(Debug)]
 struct Inner {
     id: PieceCacheId,
-    file: DirectIoFile,
+    files: FilePool,
     max_num_elements: u32,
     metrics: Option<DiskPieceCacheMetrics>,
 }
@@ -171,6 +205,28 @@ impl farm::PieceCache for DiskPieceCache {
             .await??)
         }
     }
+
+    async fn read_pieces(
+        &self,
+        offsets: Box<dyn Iterator<Item = PieceCacheOffset> + Send>,
+    ) -> Result<
+        Box<
+            dyn Stream<Item = Result<(PieceCacheOffset, Option<(PieceIndex, Piece)>), FarmError>>
+                + Send
+                + Unpin
+                + '_,
+        >,
+        FarmError,
+    > {
+        let iter = offsets.map(move |offset| async move {
+            Ok((offset, farm::PieceCache::read_piece(self, offset).await?))
+        });
+        Ok(Box::new(
+            // Constrain concurrency to avoid excessive memory usage, while still getting
+            // performance of concurrent reads
+            stream::iter(iter).buffer_unordered(PIECES_READING_CONCURRENCY),
+        ))
+    }
 }
 
 impl DiskPieceCache {
@@ -187,19 +243,22 @@ impl DiskPieceCache {
             return Err(DiskPieceCacheError::ZeroCapacity);
         }
 
-        let file = DirectIoFile::open(&directory.join(Self::FILE_NAME))?;
+        let files = FilePool::open(&directory.join(Self::FILE_NAME))?;
 
         let expected_size = u64::from(Self::element_size()) * u64::from(capacity);
         // Align plot file size for disk sector size
         let expected_size =
             expected_size.div_ceil(DISK_SECTOR_SIZE as u64) * DISK_SECTOR_SIZE as u64;
-        if file.size()? != expected_size {
-            // Allocating the whole file (`set_len` below can create a sparse file, which will cause
-            // writes to fail later)
-            file.preallocate(expected_size)
-                .map_err(DiskPieceCacheError::CantPreallocateCacheFile)?;
-            // Truncating file (if necessary)
-            file.set_len(expected_size)?;
+        {
+            let file = files.write();
+            if file.size()? != expected_size {
+                // Allocating the whole file (`set_len` below can create a sparse file, which will cause
+                // writes to fail later)
+                file.preallocate(expected_size)
+                    .map_err(DiskPieceCacheError::CantPreallocateCacheFile)?;
+                // Truncating file (if necessary)
+                file.set_len(expected_size)?;
+            }
         }
 
         // ID for cache is ephemeral unless provided explicitly
@@ -209,7 +268,7 @@ impl DiskPieceCache {
         Ok(Self {
             inner: Arc::new(Inner {
                 id,
-                file,
+                files,
                 max_num_elements: capacity,
                 metrics,
             }),
@@ -298,16 +357,16 @@ impl DiskPieceCache {
         let element_offset = u64::from(offset) * u64::from(Self::element_size());
 
         let piece_index_bytes = piece_index.to_bytes();
+        // File writes are read/write/modify internally, so combine all data here for more efficient
+        // write
+        let mut bytes = Vec::with_capacity(PieceIndex::SIZE + piece.len() + Blake3Hash::SIZE);
+        bytes.extend_from_slice(&piece_index_bytes);
+        bytes.extend_from_slice(piece.as_ref());
+        bytes.extend_from_slice(blake3_hash_list(&[&piece_index_bytes, piece.as_ref()]).as_ref());
         self.inner
-            .file
-            .write_all_at(&piece_index_bytes, element_offset)?;
-        self.inner
-            .file
-            .write_all_at(piece.as_ref(), element_offset + PieceIndex::SIZE as u64)?;
-        self.inner.file.write_all_at(
-            blake3_hash_list(&[&piece_index_bytes, piece.as_ref()]).as_ref(),
-            element_offset + PieceIndex::SIZE as u64 + Piece::SIZE as u64,
-        )?;
+            .files
+            .write()
+            .write_all_at(&bytes, element_offset)?;
 
         Ok(())
     }
@@ -377,7 +436,8 @@ impl DiskPieceCache {
         element: &mut [u8],
     ) -> Result<Option<PieceIndex>, DiskPieceCacheError> {
         self.inner
-            .file
+            .files
+            .read()
             .read_exact_at(element, u64::from(offset) * u64::from(Self::element_size()))?;
 
         let (piece_index_bytes, remaining_bytes) = element.split_at(PieceIndex::SIZE);

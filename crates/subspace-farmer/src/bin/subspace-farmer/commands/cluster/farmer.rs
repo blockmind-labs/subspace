@@ -46,13 +46,13 @@ pub(super) const FARMER_IDENTIFICATION_BROADCAST_INTERVAL: Duration = Duration::
 /// Arguments for farmer
 #[derive(Debug, Parser)]
 pub(super) struct FarmerArgs {
-    /// One or more farm located at specified path, each with its own allocated space.
+    /// One or more farms located at specified paths, each with its own allocated space.
     ///
     /// In case of multiple disks, it is recommended to specify them individually rather than using
     /// RAID 0, that way farmer will be able to better take advantage of concurrency of individual
     /// drives.
     ///
-    /// Format for each farm is coma-separated list of strings like this:
+    /// The format for each farm is a coma-separated list of strings like this:
     ///
     ///   path=/path/to/directory,size=5T
     ///
@@ -64,36 +64,49 @@ pub(super) struct FarmerArgs {
     disk_farms: Vec<DiskFarm>,
     /// Address for farming rewards
     #[arg(long, value_parser = parse_ss58_reward_address)]
-    reward_address: PublicKey,
-    /// Run temporary farmer with specified farm size in human-readable format (e.g. 10GB, 2TiB) or
+    reward_address: Option<PublicKey>,
+    /// Sets some flags that are convenient during development, currently `--reward-address` (if
+    /// not specified explicitly)
+    #[arg(long)]
+    dev: bool,
+    /// Run a temporary farmer with a farm size in human-readable format (e.g. 10GB, 2TiB) or
     /// just bytes (e.g. 4096), this will create a temporary directory that will be deleted at the
     /// end of the process.
     #[arg(long, conflicts_with = "disk_farms")]
     tmp: Option<ByteSize>,
-    /// Maximum number of pieces in sector (can override protocol value to something lower).
+    /// Maximum number of pieces in a sector (can override protocol value to something lower).
     ///
     /// This will make plotting of individual sectors faster, decrease load on CPU proving, but also
     /// proportionally increase amount of disk reads during audits since every sector needs to be
     /// audited and there will be more of them.
     ///
-    /// This is primarily for development and not recommended to use by regular users.
+    /// This is primarily for development and not recommended for regular users.
     #[arg(long)]
     max_pieces_in_sector: Option<u16>,
     /// Do not print info about configured farms on startup
     #[arg(long)]
     no_info: bool,
-    /// Defines max number sectors farmer will encode concurrently, defaults to 50. Might be limited
-    /// by plotting capacity available in the cluster.
+    /// The maximum number sectors a farmer will encode concurrently, defaults to 50. Might be
+    /// limited by plotting capacity available in the cluster.
     ///
-    /// Increase will result in higher memory usage.
+    /// Increasing this value will cause higher memory usage.
     #[arg(long, default_value = "50")]
     sector_encoding_concurrency: NonZeroUsize,
     /// Size of PER FARM thread pool used for farming (mostly for blocking I/O, but also for some
-    /// compute-intensive operations during proving), defaults to number of logical CPUs
-    /// available on UMA system and number of logical CPUs in first NUMA node on NUMA system, but
-    /// not more than 32 threads
+    /// compute-intensive operations during proving). Defaults to the number of logical CPUs
+    /// on UMA systems, or the number of logical CPUs in the first NUMA node on NUMA systems, but
+    /// limited to 32 threads.
     #[arg(long)]
     farming_thread_pool_size: Option<NonZeroUsize>,
+    /// How many sectors a will be plotted concurrently per farm.
+    ///
+    /// Defaults to 4, but can be decreased if there is a large number of farms available to
+    /// decrease peak memory usage, especially with slow disks.
+    ///
+    /// Increasing this value is not recommended and can result in excessive RAM usage due to more
+    /// sectors being stuck in-flight if writes to farm disk are too slow.
+    #[arg(long, default_value = "4")]
+    max_plotting_sectors_per_farm: NonZeroUsize,
     /// Disable farm locking, for example if file system doesn't support it
     #[arg(long)]
     disable_farm_locking: bool,
@@ -129,17 +142,35 @@ where
     let FarmerArgs {
         mut disk_farms,
         reward_address,
+        dev,
         tmp,
         max_pieces_in_sector,
         no_info,
         sector_encoding_concurrency,
         farming_thread_pool_size,
+        max_plotting_sectors_per_farm,
         disable_farm_locking,
         create,
         exit_on_farm_error,
         service_instances,
         additional_components: _,
     } = farmer_args;
+
+    let reward_address = match reward_address {
+        Some(reward_address) => reward_address,
+        None => {
+            if dev {
+                // `//Alice`
+                PublicKey::from([
+                    0xd4, 0x35, 0x93, 0xc7, 0x15, 0xfd, 0xd3, 0x1c, 0x61, 0x14, 0x1a, 0xbd, 0x04,
+                    0xa9, 0x9f, 0xd6, 0x82, 0x2c, 0x85, 0x58, 0x85, 0x4c, 0xcd, 0xe3, 0x9a, 0x56,
+                    0x84, 0xe7, 0xa5, 0x6d, 0xa2, 0x7d,
+                ])
+            } else {
+                return Err(anyhow!("`--reward-address` is required"));
+            }
+        }
+    };
 
     let tmp_directory = if let Some(plot_size) = tmp {
         let tmp_directory = tempfile::Builder::new()
@@ -262,6 +293,7 @@ where
                             farming_thread_pool_size,
                             plotting_delay: None,
                             global_mutex,
+                            max_plotting_sectors_per_farm,
                             disable_farm_locking,
                             read_sector_record_chunks_mode: disk_farm
                                 .read_sector_record_chunks_mode,

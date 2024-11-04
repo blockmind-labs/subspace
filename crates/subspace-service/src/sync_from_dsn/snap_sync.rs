@@ -12,7 +12,6 @@ use sc_consensus_subspace::archiver::{decode_block, SegmentHeadersStore};
 use sc_network::{NetworkBlock, PeerId};
 use sc_network_sync::service::network::NetworkServiceHandle;
 use sc_network_sync::SyncingService;
-use sc_service::Error;
 use sp_api::ProvideRuntimeApi;
 use sp_blockchain::HeaderBackend;
 use sp_consensus::BlockOrigin;
@@ -31,6 +30,35 @@ use subspace_networking::Node;
 use tokio::time::sleep;
 use tracing::{debug, error};
 
+/// Error type for snap sync.
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    /// A fatal snap sync error which requires user intervention.
+    /// Most snap sync errors are non-fatal, because we can just continue with regular sync.
+    #[error("Snap Sync requires user action: {0}")]
+    SnapSyncImpossible(String),
+
+    /// Substrate service error.
+    #[error(transparent)]
+    Sub(#[from] sc_service::Error),
+
+    /// Substrate blockchain client error.
+    #[error(transparent)]
+    Client(#[from] sp_blockchain::Error),
+
+    /// Other.
+    #[error("Snap sync error: {0}")]
+    Other(String),
+}
+
+impl From<String> for Error {
+    fn from(error: String) -> Self {
+        Error::Other(error)
+    }
+}
+
+/// Run a snap sync, return an error if snap sync is impossible and user intervention is required.
+/// Otherwise, just log the error and return `Ok(())` so that regular sync continues.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn snap_sync<Block, AS, Client, PG>(
     segment_headers_store: SegmentHeadersStore<AS>,
@@ -43,7 +71,8 @@ pub(crate) async fn snap_sync<Block, AS, Client, PG>(
     sync_service: Arc<SyncingService<Block>>,
     network_service_handle: NetworkServiceHandle,
     erasure_coding: ErasureCoding,
-) where
+) -> Result<(), Error>
+where
     Block: BlockT,
     AS: AuxStore,
     Client: HeaderBackend<Block>
@@ -63,7 +92,7 @@ pub(crate) async fn snap_sync<Block, AS, Client, PG>(
     if info.best_hash == info.genesis_hash {
         pause_sync.store(true, Ordering::Release);
 
-        let snap_sync_fut = sync(
+        sync(
             &segment_headers_store,
             &node,
             &piece_getter,
@@ -74,16 +103,8 @@ pub(crate) async fn snap_sync<Block, AS, Client, PG>(
             &network_service_handle,
             None,
             &erasure_coding,
-        );
-
-        match snap_sync_fut.await {
-            Ok(()) => {
-                debug!("Snap sync finished successfully");
-            }
-            Err(error) => {
-                error!(%error, "Snap sync failed");
-            }
-        }
+        )
+        .await?;
 
         // This will notify Substrate's sync mechanism and allow regular Substrate sync to continue
         // gracefully
@@ -95,6 +116,8 @@ pub(crate) async fn snap_sync<Block, AS, Client, PG>(
     } else {
         debug!("Snap sync can only work with genesis state, skipping");
     }
+
+    Ok(())
 }
 
 // Get blocks from the last segment or from the segment containing the target block.
@@ -166,10 +189,10 @@ where
 
     // We don't have the genesis state when we choose to snap sync.
     if target_segment_index <= SegmentIndex::ONE {
-        panic!(
-            "Snap sync is impossible - not enough archived history: \
-            wipe the DB folder and rerun with --sync=full"
-        );
+        // The caller logs this error
+        return Err(Error::SnapSyncImpossible(
+            "Snap sync is impossible - not enough archived history".into(),
+        ));
     }
 
     // Identify all segment headers that would need to be reconstructed in order to get first

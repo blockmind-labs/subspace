@@ -15,14 +15,20 @@ use crate::node_client::NodeClient;
 use crate::utils::run_future_in_dedicated_thread;
 use async_lock::RwLock as AsyncRwLock;
 use event_listener_primitives::{Bag, HandlerId};
+use futures::channel::mpsc;
+use futures::future::FusedFuture;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
-use futures::{select, FutureExt, StreamExt};
+use futures::{select, stream, FutureExt, SinkExt, Stream, StreamExt};
+use parking_lot::Mutex;
 use prometheus_client::registry::Registry;
 use rayon::prelude::*;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::future::join;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use std::{fmt, mem};
 use subspace_core_primitives::pieces::{Piece, PieceIndex};
@@ -33,12 +39,12 @@ use subspace_networking::libp2p::PeerId;
 use subspace_networking::utils::multihash::ToMultihash;
 use subspace_networking::{KeyWithDistance, LocalRecordProvider};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
 use tokio::task::{block_in_place, yield_now};
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
 const WORKER_CHANNEL_CAPACITY: usize = 100;
-const CONCURRENT_PIECES_TO_DOWNLOAD: usize = 1_000;
+const SYNC_BATCH_SIZE: usize = 256;
+const SYNC_CONCURRENT_BATCHES: usize = 4;
 /// Make caches available as they are building without waiting for the initialization to finish,
 /// this number defines an interval in pieces after which cache is updated
 const INTERMEDIATE_CACHE_UPDATE_INTERVAL: usize = 100;
@@ -170,7 +176,7 @@ where
             .expect("Always set during worker instantiation");
 
         if let Some(WorkerCommand::ReplaceBackingCaches { new_piece_caches }) =
-            worker_receiver.recv().await
+            worker_receiver.next().await
         {
             self.initialize(
                 &piece_getter,
@@ -200,7 +206,7 @@ where
 
         loop {
             select! {
-                maybe_command = worker_receiver.recv().fuse() => {
+                maybe_command = worker_receiver.next() => {
                     let Some(command) = maybe_command else {
                         // Nothing else left to do
                         return;
@@ -269,7 +275,7 @@ where
                             %cache_index,
                             ?key,
                             %piece_offset,
-                            "Error while reading piece from cache, might be a disk corruption"
+                            "Error while reading piece from cache"
                         );
                     }
                 }
@@ -520,98 +526,125 @@ where
             "Identified piece indices that should be cached",
         );
 
-        let mut piece_indices_to_store = piece_indices_to_store.into_values().collect::<Vec<_>>();
-        // Sort pieces such that they are in ascending order and have higher chance of download
-        // overlapping with other processes like node's sync from DSN
-        piece_indices_to_store.par_sort_unstable();
-        let mut piece_indices_to_store = piece_indices_to_store.into_iter();
-
-        let download_piece = |piece_index| async move {
-            trace!(%piece_index, "Downloading piece");
-
-            let result = piece_getter.get_piece(piece_index).await;
-
-            match result {
-                Ok(Some(piece)) => {
-                    trace!(%piece_index, "Downloaded piece successfully");
-
-                    Some((piece_index, piece))
-                }
-                Ok(None) => {
-                    debug!(%piece_index, "Couldn't find piece");
-                    None
-                }
-                Err(error) => {
-                    debug!(%error, %piece_index, "Failed to get piece for piece cache");
-                    None
-                }
-            }
-        };
-
         let pieces_to_download_total = piece_indices_to_store.len();
-        let mut downloading_pieces = piece_indices_to_store
-            .by_ref()
-            .take(CONCURRENT_PIECES_TO_DOWNLOAD)
-            .map(download_piece)
-            .collect::<FuturesUnordered<_>>();
+        let piece_indices_to_store = piece_indices_to_store
+            .into_values()
+            .collect::<Vec<_>>()
+            // TODO: Allocating chunks here shouldn't be necessary, but otherwise it fails with
+            //  confusing error described in https://github.com/rust-lang/rust/issues/64552 and
+            //  similar upstream issues
+            .chunks(SYNC_BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
 
-        let mut downloaded_pieces_count = 0;
+        let downloaded_pieces_count = AtomicUsize::new(0);
+        let caches = Mutex::new(caches);
         self.handlers.progress.call_simple(&0.0);
-        while let Some(maybe_piece) = downloading_pieces.next().await {
-            // Push another piece to download
-            if let Some(piece_index_to_download) = piece_indices_to_store.next() {
-                downloading_pieces.push(download_piece(piece_index_to_download));
-            }
 
-            let Some((piece_index, piece)) = &maybe_piece else {
-                continue;
-            };
+        let downloading_pieces_stream =
+            stream::iter(piece_indices_to_store.into_iter().map(|piece_indices| {
+                let downloaded_pieces_count = &downloaded_pieces_count;
+                let caches = &caches;
 
-            // Find plot in which there is a place for new piece to be stored
-            let Some(offset) = caches.pop_free_offset() else {
-                error!(
-                    %piece_index,
-                    "Failed to store piece in cache, there was no space"
-                );
-                break;
-            };
+                async move {
+                    let mut pieces_stream = match piece_getter.get_pieces(piece_indices).await {
+                        Ok(pieces_stream) => pieces_stream,
+                        Err(error) => {
+                            error!(
+                                %error,
+                                "Failed to get pieces from piece getter"
+                            );
+                            return;
+                        }
+                    };
 
-            let cache_index = offset.cache_index;
-            let piece_offset = offset.piece_offset;
-            if let Some(backend) = caches.get_backend(cache_index)
-                && let Err(error) = backend.write_piece(piece_offset, *piece_index, piece).await
-            {
-                // TODO: Will likely need to cache problematic backend indices to avoid hitting it over and over again repeatedly
-                error!(
-                    %error,
-                    %cache_index,
-                    %piece_index,
-                    %piece_offset,
-                    "Failed to write piece into cache"
-                );
-                continue;
-            }
+                    while let Some((piece_index, result)) = pieces_stream.next().await {
+                        let piece = match result {
+                            Ok(Some(piece)) => {
+                                trace!(%piece_index, "Downloaded piece successfully");
+                                piece
+                            }
+                            Ok(None) => {
+                                debug!(%piece_index, "Couldn't find piece");
+                                continue;
+                            }
+                            Err(error) => {
+                                debug!(
+                                    %error,
+                                    %piece_index,
+                                    "Failed to get piece for piece cache"
+                                );
+                                continue;
+                            }
+                        };
 
-            let key = KeyWithDistance::new(self.peer_id, piece_index.to_multihash());
-            caches.push_stored_piece(key, offset);
+                        let (offset, maybe_backend) = {
+                            let mut caches = caches.lock();
 
-            downloaded_pieces_count += 1;
-            // Do not print anything or send progress notification after last piece until piece
-            // cache is written fully below
-            if downloaded_pieces_count != pieces_to_download_total {
-                let progress =
-                    downloaded_pieces_count as f32 / pieces_to_download_total as f32 * 100.0;
-                if downloaded_pieces_count % INTERMEDIATE_CACHE_UPDATE_INTERVAL == 0 {
-                    self.piece_caches.write().await.clone_from(&caches);
+                            // Find plot in which there is a place for new piece to be stored
+                            let Some(offset) = caches.pop_free_offset() else {
+                                error!(
+                                    %piece_index,
+                                    "Failed to store piece in cache, there was no space"
+                                );
+                                break;
+                            };
 
-                    info!("Piece cache sync {progress:.2}% complete");
+                            (offset, caches.get_backend(offset.cache_index).cloned())
+                        };
+
+                        let cache_index = offset.cache_index;
+                        let piece_offset = offset.piece_offset;
+
+                        if let Some(backend) = maybe_backend
+                            && let Err(error) =
+                                backend.write_piece(piece_offset, piece_index, &piece).await
+                        {
+                            // TODO: Will likely need to cache problematic backend indices to avoid hitting it over and over again repeatedly
+                            error!(
+                                %error,
+                                %cache_index,
+                                %piece_index,
+                                %piece_offset,
+                                "Failed to write piece into cache"
+                            );
+                            continue;
+                        }
+
+                        let key = KeyWithDistance::new(self.peer_id, piece_index.to_multihash());
+                        caches.lock().push_stored_piece(key, offset);
+
+                        let prev_downloaded_pieces_count =
+                            downloaded_pieces_count.fetch_add(1, Ordering::Relaxed);
+                        // Do not print anything or send progress notification after last piece
+                        // until piece cache is written fully below
+                        if prev_downloaded_pieces_count != pieces_to_download_total {
+                            let progress = prev_downloaded_pieces_count as f32
+                                / pieces_to_download_total as f32
+                                * 100.0;
+                            if prev_downloaded_pieces_count % INTERMEDIATE_CACHE_UPDATE_INTERVAL
+                                == 0
+                            {
+                                let mut piece_caches = self.piece_caches.write().await;
+                                piece_caches.clone_from(&caches.lock());
+
+                                info!("Piece cache sync {progress:.2}% complete");
+                            }
+
+                            self.handlers.progress.call_simple(&progress);
+                        }
+                    }
                 }
+            }));
+        // Download several batches concurrently to make sure slow tail of one is compensated by
+        // another
+        downloading_pieces_stream
+            .buffer_unordered(SYNC_CONCURRENT_BATCHES)
+            // Simply drain everything
+            .for_each(|()| async {})
+            .await;
 
-                self.handlers.progress.call_simple(&progress);
-            }
-        }
-
-        *self.piece_caches.write().await = caches;
+        *self.piece_caches.write().await = caches.into_inner();
         self.handlers.progress.call_simple(&100.0);
         *last_segment_index_internal = last_segment_index;
 
@@ -775,7 +808,7 @@ where
         let piece_indices = (*last_segment_index_internal..=last_segment_index)
             .flat_map(|segment_index| segment_index.segment_piece_indexes());
 
-        // TODO: Can probably do concurrency here
+        // TODO: Download pieces concurrently
         for piece_index in piece_indices {
             if !self
                 .piece_caches
@@ -995,7 +1028,7 @@ pub struct FarmerCache<CacheIndex> {
     plot_caches: Arc<PlotCaches>,
     handlers: Arc<Handlers>,
     // We do not want to increase capacity unnecessarily on clone
-    worker_sender: Arc<mpsc::Sender<WorkerCommand>>,
+    worker_sender: mpsc::Sender<WorkerCommand>,
     metrics: Option<Arc<FarmerCacheMetrics>>,
 }
 
@@ -1032,7 +1065,7 @@ where
             piece_caches: Arc::clone(&caches),
             plot_caches: Arc::clone(&plot_caches),
             handlers: Arc::clone(&handlers),
-            worker_sender: Arc::new(worker_sender),
+            worker_sender,
             metrics: metrics.clone(),
         };
         let worker = FarmerCacheWorker {
@@ -1080,8 +1113,14 @@ where
                             Some(piece)
                         }
                         None => {
+                            error!(
+                                %cache_index,
+                                %piece_offset,
+                                ?key,
+                                "Piece was expected to be in cache, but wasn't found there"
+                            );
                             if let Some(metrics) = &self.metrics {
-                                metrics.cache_get_miss.inc();
+                                metrics.cache_get_error.inc();
                             }
                             None
                         }
@@ -1093,11 +1132,12 @@ where
                         %cache_index,
                         ?key,
                         %piece_offset,
-                        "Error while reading piece from cache, might be a disk corruption"
+                        "Error while reading piece from cache"
                     );
 
                     if let Err(error) = self
                         .worker_sender
+                        .clone()
                         .send(WorkerCommand::ForgetKey { key })
                         .await
                     {
@@ -1127,6 +1167,247 @@ where
         None
     }
 
+    /// Get pieces from cache.
+    ///
+    /// Number of elements in returned stream is the same as number of unique `piece_indices`.
+    pub async fn get_pieces<'a, PieceIndices>(
+        &'a self,
+        piece_indices: PieceIndices,
+    ) -> impl Stream<Item = (PieceIndex, Option<Piece>)> + Send + Unpin + 'a
+    where
+        PieceIndices: IntoIterator<Item = PieceIndex, IntoIter: Send + 'a> + Send + 'a,
+    {
+        let mut pieces_to_get_from_plot_cache = Vec::new();
+
+        let pieces_to_read_from_piece_cache = {
+            let caches = self.piece_caches.read().await;
+            // Pieces to read from piece cache grouped by backend for efficiency reasons
+            let mut pieces_to_read_from_piece_cache =
+                HashMap::<CacheIndex, (CacheBackend, HashMap<_, _>)>::new();
+
+            for piece_index in piece_indices {
+                let key = RecordKey::from(piece_index.to_multihash());
+
+                let offset = match caches.get_stored_piece(&KeyWithDistance::new_with_record_key(
+                    self.peer_id,
+                    key.clone(),
+                )) {
+                    Some(offset) => offset,
+                    None => {
+                        pieces_to_get_from_plot_cache.push((piece_index, key));
+                        continue;
+                    }
+                };
+
+                let cache_index = offset.cache_index;
+                let piece_offset = offset.piece_offset;
+
+                match pieces_to_read_from_piece_cache.entry(cache_index) {
+                    Entry::Occupied(mut entry) => {
+                        let (_backend, pieces) = entry.get_mut();
+                        pieces.insert(piece_offset, (piece_index, key));
+                    }
+                    Entry::Vacant(entry) => {
+                        let backend = match caches.get_backend(cache_index) {
+                            Some(backend) => backend.clone(),
+                            None => {
+                                pieces_to_get_from_plot_cache.push((piece_index, key));
+                                continue;
+                            }
+                        };
+                        entry
+                            .insert((backend, HashMap::from([(piece_offset, (piece_index, key))])));
+                    }
+                }
+            }
+
+            pieces_to_read_from_piece_cache
+        };
+
+        let (tx, mut rx) = mpsc::unbounded();
+
+        let fut = async move {
+            let tx = &tx;
+
+            let mut reading_from_piece_cache = pieces_to_read_from_piece_cache
+                .into_iter()
+                .map(|(cache_index, (backend, mut pieces_to_get))| async move {
+                    let mut pieces_stream = match backend
+                        .read_pieces(Box::new(
+                            pieces_to_get
+                                .keys()
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .into_iter(),
+                        ))
+                        .await
+                    {
+                        Ok(pieces_stream) => pieces_stream,
+                        Err(error) => {
+                            error!(
+                                %error,
+                                %cache_index,
+                                "Error while reading pieces from cache"
+                            );
+
+                            if let Some(metrics) = &self.metrics {
+                                metrics.cache_get_error.inc_by(pieces_to_get.len() as u64);
+                            }
+                            for (piece_index, _key) in pieces_to_get.into_values() {
+                                tx.unbounded_send((piece_index, None)).expect(
+                                    "This future isn't polled after receiver is dropped; qed",
+                                );
+                            }
+                            return;
+                        }
+                    };
+
+                    while let Some(maybe_piece) = pieces_stream.next().await {
+                        let result = match maybe_piece {
+                            Ok((piece_offset, Some((piece_index, piece)))) => {
+                                pieces_to_get.remove(&piece_offset);
+
+                                if let Some(metrics) = &self.metrics {
+                                    metrics.cache_get_hit.inc();
+                                }
+                                (piece_index, Some(piece))
+                            }
+                            Ok((piece_offset, None)) => {
+                                let Some((piece_index, key)) = pieces_to_get.remove(&piece_offset)
+                                else {
+                                    debug!(
+                                        %cache_index,
+                                        %piece_offset,
+                                        "Received piece offset that was not expected"
+                                    );
+                                    continue;
+                                };
+
+                                error!(
+                                    %cache_index,
+                                    %piece_index,
+                                    %piece_offset,
+                                    ?key,
+                                    "Piece was expected to be in cache, but wasn't found there"
+                                );
+                                if let Some(metrics) = &self.metrics {
+                                    metrics.cache_get_error.inc();
+                                }
+                                (piece_index, None)
+                            }
+                            Err(error) => {
+                                error!(
+                                    %error,
+                                    %cache_index,
+                                    "Error while reading piece from cache"
+                                );
+
+                                if let Some(metrics) = &self.metrics {
+                                    metrics.cache_get_error.inc();
+                                }
+                                continue;
+                            }
+                        };
+
+                        tx.unbounded_send(result)
+                            .expect("This future isn't polled after receiver is dropped; qed");
+                    }
+
+                    if pieces_to_get.is_empty() {
+                        return;
+                    }
+
+                    if let Some(metrics) = &self.metrics {
+                        metrics.cache_get_error.inc_by(pieces_to_get.len() as u64);
+                    }
+                    for (piece_offset, (piece_index, key)) in pieces_to_get {
+                        error!(
+                            %cache_index,
+                            %piece_index,
+                            %piece_offset,
+                            ?key,
+                            "Piece cache didn't return an entry for offset"
+                        );
+
+                        // Uphold invariant of the method that some result should be returned
+                        // for every unique piece index
+                        tx.unbounded_send((piece_index, None))
+                            .expect("This future isn't polled after receiver is dropped; qed");
+                    }
+                })
+                .collect::<FuturesUnordered<_>>();
+            // TODO: Can't use this due to https://github.com/rust-lang/rust/issues/64650
+            // Simply drain everything
+            // .for_each(|()| async {})
+
+            // TODO: Remove once https://github.com/rust-lang/rust/issues/64650 is resolved
+            let reading_from_piece_cache_fut = async move {
+                while let Some(()) = reading_from_piece_cache.next().await {
+                    // Simply drain everything
+                }
+            };
+
+            let reading_from_plot_cache_fut = async {
+                if pieces_to_get_from_plot_cache.is_empty() {
+                    return;
+                }
+
+                for cache in self.plot_caches.caches.read().await.iter() {
+                    // Iterating over offsets in reverse order to both traverse elements in async code
+                    // and being able to efficiently remove entries without extra allocations
+                    for offset in (0..pieces_to_get_from_plot_cache.len()).rev() {
+                        let (piece_index, key) = &pieces_to_get_from_plot_cache[offset];
+
+                        if let Ok(Some(piece)) = cache.read_piece(key).await {
+                            if let Some(metrics) = &self.metrics {
+                                metrics.cache_get_hit.inc();
+                            }
+                            tx.unbounded_send((*piece_index, Some(piece)))
+                                .expect("This future isn't polled after receiver is dropped; qed");
+
+                            // Due to iteration in reverse order and swapping using elements at the end,
+                            // this doesn't affect processing of the elements
+                            pieces_to_get_from_plot_cache.swap_remove(offset);
+                        }
+                    }
+
+                    if pieces_to_get_from_plot_cache.is_empty() {
+                        return;
+                    }
+                }
+
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .cache_get_miss
+                        .inc_by(pieces_to_get_from_plot_cache.len() as u64);
+                }
+
+                for (piece_index, _key) in pieces_to_get_from_plot_cache {
+                    tx.unbounded_send((piece_index, None))
+                        .expect("This future isn't polled after receiver is dropped; qed");
+                }
+            };
+
+            join!(reading_from_piece_cache_fut, reading_from_plot_cache_fut).await
+        };
+        let mut fut = Box::pin(fut.fuse());
+
+        // Drive above future and stream back any pieces that were downloaded so far
+        stream::poll_fn(move |cx| {
+            if !fut.is_terminated() {
+                // Result doesn't matter, we'll need to poll stream below anyway
+                let _ = fut.poll_unpin(cx);
+            }
+
+            if let Poll::Ready(maybe_result) = rx.poll_next_unpin(cx) {
+                return Poll::Ready(maybe_result);
+            }
+
+            // Exit will be done by the stream above
+            Poll::Pending
+        })
+    }
+
     /// Returns a filtered list of pieces that were found in farmer cache, order is not guaranteed
     pub async fn has_pieces(&self, mut piece_indices: Vec<PieceIndex>) -> Vec<PieceIndex> {
         let mut pieces_to_find = HashMap::<PieceIndex, RecordKey>::from_iter(
@@ -1136,7 +1417,8 @@ where
         );
 
         // Quick check in piece caches
-        if let Some(piece_caches) = self.piece_caches.try_read() {
+        {
+            let piece_caches = self.piece_caches.read().await;
             pieces_to_find.retain(|_piece_index, key| {
                 let distance_key = KeyWithDistance::new(self.peer_id, key.clone());
                 !piece_caches.contains_stored_piece(&distance_key)
@@ -1184,13 +1466,41 @@ where
     }
 
     /// Find piece in cache and return its retrieval details
-    pub(crate) async fn find_piece(
+    pub async fn find_piece(
         &self,
+        piece_index: PieceIndex,
+    ) -> Option<(PieceCacheId, PieceCacheOffset)> {
+        let caches = self.piece_caches.read().await;
+
+        self.find_piece_internal(&caches, piece_index)
+    }
+
+    /// Find pieces in cache and return their retrieval details
+    pub async fn find_pieces<PieceIndices>(
+        &self,
+        piece_indices: PieceIndices,
+    ) -> Vec<(PieceIndex, PieceCacheId, PieceCacheOffset)>
+    where
+        PieceIndices: IntoIterator<Item = PieceIndex>,
+    {
+        let caches = self.piece_caches.read().await;
+
+        piece_indices
+            .into_iter()
+            .filter_map(|piece_index| {
+                self.find_piece_internal(&caches, piece_index)
+                    .map(|(cache_id, piece_offset)| (piece_index, cache_id, piece_offset))
+            })
+            .collect()
+    }
+
+    fn find_piece_internal(
+        &self,
+        caches: &PieceCachesState<CacheIndex>,
         piece_index: PieceIndex,
     ) -> Option<(PieceCacheId, PieceCacheOffset)> {
         let key = KeyWithDistance::new(self.peer_id, piece_index.to_multihash());
 
-        let caches = self.piece_caches.read().await;
         let Some(offset) = caches.get_stored_piece(&key) else {
             if let Some(metrics) = &self.metrics {
                 metrics.cache_find_miss.inc();
@@ -1236,6 +1546,7 @@ where
     ) {
         if let Err(error) = self
             .worker_sender
+            .clone()
             .send(WorkerCommand::ReplaceBackingCaches { new_piece_caches })
             .await
         {

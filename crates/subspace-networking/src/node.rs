@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use crate::protocols::request_response::handlers::generic_request_handler::GenericRequest;
 use crate::protocols::request_response::request_response_factory;
 use crate::shared::{Command, CreatedSubscription, PeerDiscovered, Shared};
@@ -372,6 +375,7 @@ impl Node {
     async fn send_generic_request_internal<Request>(
         &self,
         peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
         request: Request,
         acquire_permit: bool,
     ) -> Result<Request::Response, SendRequestError>
@@ -387,6 +391,7 @@ impl Node {
         let (result_sender, result_receiver) = oneshot::channel();
         let command = Command::GenericRequest {
             peer_id,
+            addresses,
             protocol_name: Request::PROTOCOL_NAME,
             request: request.encode(),
             result_sender,
@@ -400,15 +405,18 @@ impl Node {
     }
 
     /// Sends the generic request to the peer and awaits the result.
+    ///
+    /// Optional addresses will be used for dialing if connection to peer isn't established yet.
     pub async fn send_generic_request<Request>(
         &self,
         peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
         request: Request,
     ) -> Result<Request::Response, SendRequestError>
     where
         Request: GenericRequest,
     {
-        self.send_generic_request_internal(peer_id, request, true)
+        self.send_generic_request_internal(peer_id, addresses, request, true)
             .await
     }
 
@@ -423,7 +431,7 @@ impl Node {
     /// Get closest peers by multihash key using Kademlia DHT's local view without any network
     /// requests.
     ///
-    /// Optional `source` is peer for which results will be sent as a response, defaults to local
+    /// Optional `source` is peer for which results will be sent as a response. Defaults to local
     /// peer ID.
     pub async fn get_closest_local_peers(
         &self,
@@ -675,16 +683,19 @@ impl NodeRequestsBatchHandle {
         self.node.get_closest_peers_internal(key, false).await
     }
     /// Sends the generic request to the peer and awaits the result.
+    ///
+    /// Optional addresses will be used for dialing if connection to peer isn't established yet.
     pub async fn send_generic_request<Request>(
         &mut self,
         peer_id: PeerId,
+        addresses: Vec<Multiaddr>,
         request: Request,
     ) -> Result<Request::Response, SendRequestError>
     where
         Request: GenericRequest,
     {
         self.node
-            .send_generic_request_internal(peer_id, request, false)
+            .send_generic_request_internal(peer_id, addresses, request, false)
             .await
     }
 }

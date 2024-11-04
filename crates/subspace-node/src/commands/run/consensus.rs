@@ -60,15 +60,15 @@ fn parse_timekeeper_cpu_cores(
 /// Options for Substrate networking
 #[derive(Debug, Parser)]
 struct SubstrateNetworkOptions {
-    /// Specify a list of bootstrap nodes for Substrate networking stack.
-    #[arg(long)]
+    /// A list of bootstrap nodes for the Substrate networking stack.
+    #[arg(long = "bootstrap-node")]
     bootstrap_nodes: Vec<MultiaddrWithPeerId>,
 
-    /// Specify a list of reserved node addresses.
-    #[arg(long)]
-    reserved_nodes: Vec<MultiaddrWithPeerId>,
+    /// A list of reserved node addresses, which are prioritised for connections.
+    #[arg(long = "reserved-peer")]
+    reserved_peers: Vec<MultiaddrWithPeerId>,
 
-    /// Whether to only synchronize the chain with reserved nodes.
+    /// Only synchronize the chain with reserved nodes.
     ///
     /// TCP connections might still be established with non-reserved nodes.
     /// In particular, if you are a farmer your node might still connect to other farmer nodes
@@ -76,14 +76,14 @@ struct SubstrateNetworkOptions {
     #[arg(long)]
     reserved_only: bool,
 
-    /// The public address that other nodes will use to connect to it.
+    /// The public address that other nodes will use to connect to this node.
     ///
     /// This can be used if there's a proxy in front of this node or if address is known beforehand
     /// and less reliable auto-discovery can be avoided.
-    #[arg(long)]
-    public_addr: Vec<sc_network::Multiaddr>,
+    #[arg(long = "external-address")]
+    external_addresses: Vec<sc_network::Multiaddr>,
 
-    /// Listen on this multiaddress
+    /// Listen for incoming Substrate connections on these multiaddresses.
     #[arg(long, default_values_t = [
         sc_network::Multiaddr::from(sc_network::multiaddr::Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
             .with(sc_network::multiaddr::Protocol::Tcp(30333)),
@@ -92,12 +92,12 @@ struct SubstrateNetworkOptions {
     ])]
     listen_on: Vec<sc_network::Multiaddr>,
 
-    /// Determines whether we allow keeping non-global (private, shared, loopback..) addresses
-    /// in Kademlia DHT.
+    /// Enable non-global (private, shared, loopback..) addresses in the Kademlia DHT.
+    /// By default, these addresses are excluded from the DHT.
     #[arg(long, default_value_t = false)]
     allow_private_ips: bool,
 
-    /// Specify the number of outgoing connections we're trying to maintain.
+    /// The number of outgoing connections we will try to maintain.
     #[arg(long, default_value_t = 8)]
     out_peers: u32,
 
@@ -119,7 +119,7 @@ struct SubstrateNetworkOptions {
 /// Options for DSN
 #[derive(Debug, Parser)]
 struct DsnOptions {
-    /// Where local DSN node will listen for incoming connections.
+    /// Listen for incoming DSN connections on these multiaddresses.
     #[arg(long, default_values_t = [
         Multiaddr::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .with(Protocol::Tcp(30433)),
@@ -129,30 +129,30 @@ struct DsnOptions {
     dsn_listen_on: Vec<Multiaddr>,
 
     /// Bootstrap nodes for DSN.
-    #[arg(long)]
+    #[arg(long = "dsn-bootstrap-node")]
     dsn_bootstrap_nodes: Vec<Multiaddr>,
 
     /// Reserved peers for DSN.
-    #[arg(long)]
+    #[arg(long = "dsn-reserved-peer")]
     dsn_reserved_peers: Vec<Multiaddr>,
 
-    /// Defines max established incoming connection limit for DSN.
+    /// Maximum established incoming connection limit for DSN.
     #[arg(long, default_value_t = 50)]
     dsn_in_connections: u32,
 
-    /// Defines max established outgoing swarm connection limit for DSN.
+    /// Maximum established outgoing swarm connection limit for DSN.
     #[arg(long, default_value_t = 150)]
     dsn_out_connections: u32,
 
-    /// Defines max pending incoming connection limit for DSN.
+    /// Maximum pending incoming connection limit for DSN.
     #[arg(long, default_value_t = 100)]
     dsn_pending_in_connections: u32,
 
-    /// Defines max pending outgoing swarm connection limit for DSN.
+    /// Maximum pending outgoing swarm connection limit for DSN.
     #[arg(long, default_value_t = 150)]
     dsn_pending_out_connections: u32,
 
-    /// Known external addresses
+    /// Known external addresses.
     #[arg(long = "dsn-external-address")]
     dsn_external_addresses: Vec<Multiaddr>,
 }
@@ -234,7 +234,7 @@ impl fmt::Display for BlocksPruningMode {
 /// Parameters to define the pruning mode
 #[derive(Debug, Clone, Parser)]
 struct PruningOptions {
-    /// Specify the state pruning mode.
+    /// The state pruning mode.
     ///
     /// This mode specifies when the block's state (ie, storage) should be pruned (ie, removed)
     /// from the database.
@@ -247,7 +247,7 @@ struct PruningOptions {
     #[arg(long, default_value_t = StatePruningMode::Number(MIN_STATE_PRUNING))]
     state_pruning: StatePruningMode,
 
-    /// Specify the blocks pruning mode.
+    /// The blocks pruning mode.
     ///
     /// This mode specifies when the block's body (including justifications)
     /// should be pruned (ie, removed) from the database.
@@ -305,13 +305,13 @@ struct TimekeeperOptions {
 /// Options for running a node
 #[derive(Debug, Parser)]
 pub(super) struct ConsensusChainOptions {
-    /// Base path where to store node files.
+    /// Base path to store node files.
     ///
     /// Required unless --dev mode is used.
     #[arg(long)]
     base_path: Option<PathBuf>,
 
-    /// Specify the chain specification.
+    /// The chain specification.
     ///
     /// It can be one of the predefined ones (dev) or it can be a path to a file with the chainspec
     /// (such as one exported by the `build-spec` subcommand).
@@ -333,6 +333,7 @@ pub(super) struct ConsensusChainOptions {
     /// * `--tmp` (unless `--base-path` specified explicitly)
     /// * `--force-synced`
     /// * `--force-authoring`
+    /// * `--create-object-mappings`
     /// * `--allow-private-ips`
     /// * `--rpc-cors all` (unless specified explicitly)
     /// * `--dsn-disable-bootstrap-on-start`
@@ -377,9 +378,8 @@ pub(super) struct ConsensusChainOptions {
     #[clap(flatten)]
     pool_config: TransactionPoolParams,
 
-    /// Parameter that allows node to forcefully assume it is synced, needed for network
-    /// bootstrapping only, as long as two synced nodes remain on the network at any time, this
-    /// doesn't need to be used.
+    /// Make the node forcefully assume it is synced, needed for network bootstrapping only. As
+    /// long as two synced nodes remain on the network at any time, this doesn't need to be used.
     ///
     /// --dev mode enables this option automatically.
     #[clap(long)]
@@ -388,6 +388,13 @@ pub(super) struct ConsensusChainOptions {
     /// Enable authoring even when offline, needed for network bootstrapping only.
     #[arg(long)]
     force_authoring: bool,
+
+    /// Create object mappings for new blocks, and blocks that have already been archived.
+    /// By default, mappings are not created for any blocks.
+    ///
+    /// --dev mode enables this option automatically.
+    #[arg(long)]
+    create_object_mappings: bool,
 
     /// External entropy, used initially when PoT chain starts to derive the first seed
     #[arg(long)]
@@ -446,6 +453,7 @@ pub(super) fn create_consensus_chain_configuration(
         pool_config,
         mut force_synced,
         mut force_authoring,
+        mut create_object_mappings,
         pot_external_entropy,
         dsn_options,
         storage_monitor,
@@ -466,6 +474,7 @@ pub(super) fn create_consensus_chain_configuration(
             tmp = true;
             force_synced = true;
             force_authoring = true;
+            create_object_mappings = true;
             network_options.allow_private_ips = true;
             timekeeper_options.timekeeper = true;
 
@@ -483,8 +492,10 @@ pub(super) fn create_consensus_chain_configuration(
                 Cors::List(vec![
                     "http://localhost:*".into(),
                     "http://127.0.0.1:*".into(),
+                    "http://[::1]:*".into(),
                     "https://localhost:*".into(),
                     "https://127.0.0.1:*".into(),
+                    "https://[::1]:*".into(),
                     "https://polkadot.js.org".into(),
                 ])
             }
@@ -495,8 +506,8 @@ pub(super) fn create_consensus_chain_configuration(
     let sync = sync.unwrap_or(ChainSyncMode::Snap);
 
     let chain_spec = match chain.as_deref() {
-        Some("gemini-3h-compiled") => chain_spec::gemini_3h_compiled()?,
-        Some("gemini-3h") => chain_spec::gemini_3h_config()?,
+        Some("taurus-compiled") => chain_spec::taurus_compiled()?,
+        Some("taurus") => chain_spec::taurus_config()?,
         Some("devnet") => chain_spec::devnet_config()?,
         Some("devnet-compiled") => chain_spec::devnet_config_compiled()?,
         Some("dev") => chain_spec::dev_config()?,
@@ -550,7 +561,7 @@ pub(super) fn create_consensus_chain_configuration(
         transaction_pool,
         network: SubstrateNetworkConfiguration {
             listen_on: network_options.listen_on,
-            public_addresses: network_options.public_addr,
+            public_addresses: network_options.external_addresses,
             bootstrap_nodes: network_options.bootstrap_nodes,
             node_key: {
                 let node_key_params = NodeKeyParams {
@@ -565,7 +576,7 @@ pub(super) fn create_consensus_chain_configuration(
             default_peers_set: SetConfig {
                 in_peers: network_options.in_peers,
                 out_peers: network_options.out_peers,
-                reserved_nodes: network_options.reserved_nodes,
+                reserved_nodes: network_options.reserved_peers,
                 non_reserved_mode: if network_options.reserved_only {
                     NonReservedPeerMode::Deny
                 } else {
@@ -677,6 +688,7 @@ pub(super) fn create_consensus_chain_configuration(
             base: consensus_chain_config,
             // Domain node needs slots notifications for bundle production.
             force_new_slot_notifications: domains_enabled,
+            create_object_mappings,
             subspace_networking: SubspaceNetworking::Create { config: dsn_config },
             dsn_piece_getter: None,
             sync,

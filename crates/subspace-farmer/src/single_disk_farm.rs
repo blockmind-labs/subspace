@@ -55,10 +55,10 @@ use rayon::{ThreadPoolBuildError, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
 use static_assertions::const_assert;
 use std::collections::HashSet;
-use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -302,6 +302,8 @@ where
     /// that those operations that are very sensitive (like proving) have all the resources
     /// available to them for the highest probability of success
     pub global_mutex: Arc<AsyncMutex<()>>,
+    /// How many sectors a will be plotted concurrently per farm
+    pub max_plotting_sectors_per_farm: NonZeroUsize,
     /// Disable farm locking, for example if file system doesn't support it
     pub disable_farm_locking: bool,
     /// Explicit mode to use for reading of sector record chunks instead of doing internal
@@ -550,7 +552,7 @@ pub enum BackgroundTaskError {
     Farming(#[from] FarmingError),
     /// Reward signing
     #[error(transparent)]
-    RewardSigning(#[from] Box<dyn Error + Send + Sync + 'static>),
+    RewardSigning(#[from] anyhow::Error),
     /// Background task panicked
     #[error("Background task {task} panicked")]
     BackgroundTaskPanicked {
@@ -846,6 +848,7 @@ impl SingleDiskFarm {
             farming_thread_pool_size,
             plotting_delay,
             global_mutex,
+            max_plotting_sectors_per_farm,
             disable_farm_locking,
             read_sector_record_chunks_mode,
             faster_read_sector_record_chunks_mode_barrier,
@@ -959,7 +962,9 @@ impl SingleDiskFarm {
         let farming_plot_fut = task::spawn_blocking(|| {
             farming_thread_pool
                 .install(move || {
-                    RayonFiles::open_with(&directory.join(Self::PLOT_FILE), DirectIoFile::open)
+                    RayonFiles::open_with(directory.join(Self::PLOT_FILE), |path| {
+                        DirectIoFile::open(path)
+                    })
                 })
                 .map(|farming_plot| (farming_plot, farming_thread_pool))
         });
@@ -1032,6 +1037,7 @@ impl SingleDiskFarm {
                         plotter,
                         metrics,
                     },
+                    max_plotting_sectors_per_farm,
                 };
 
                 let plotting_fut = async {
@@ -1227,10 +1233,9 @@ impl SingleDiskFarm {
                     reward_signing_fut.await;
                 }
                 Err(error) => {
-                    return Err(BackgroundTaskError::RewardSigning(
-                        format!("Failed to subscribe to reward signing notifications: {error}")
-                            .into(),
-                    ));
+                    return Err(BackgroundTaskError::RewardSigning(anyhow::anyhow!(
+                        "Failed to subscribe to reward signing notifications: {error}"
+                    )));
                 }
             }
 
@@ -1463,7 +1468,7 @@ impl SingleDiskFarm {
             Arc::new(AsyncRwLock::new(sectors_metadata))
         };
 
-        let plot_file = DirectIoFile::open(&directory.join(Self::PLOT_FILE))?;
+        let plot_file = DirectIoFile::open(directory.join(Self::PLOT_FILE))?;
 
         if plot_file.size()? != allocated_space_distribution.plot_file_size {
             // Allocating the whole file (`set_len` below can create a sparse file, which will cause
@@ -1606,7 +1611,7 @@ impl SingleDiskFarm {
     pub fn read_all_sectors_metadata(
         directory: &Path,
     ) -> io::Result<Vec<SectorMetadataChecksummed>> {
-        let metadata_file = DirectIoFile::open(&directory.join(Self::METADATA_FILE))?;
+        let metadata_file = DirectIoFile::open(directory.join(Self::METADATA_FILE))?;
 
         let metadata_size = metadata_file.size()?;
         let sector_metadata_size = SectorMetadataChecksummed::encoded_size();

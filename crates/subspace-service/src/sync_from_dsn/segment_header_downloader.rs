@@ -3,6 +3,7 @@ use futures::StreamExt;
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::pin::pin;
+use std::sync::Arc;
 use subspace_core_primitives::segments::{SegmentHeader, SegmentIndex};
 use subspace_networking::libp2p::PeerId;
 use subspace_networking::protocols::request_response::handlers::segment_header::{
@@ -142,7 +143,16 @@ impl<'a> SegmentHeaderDownloader<'a> {
 
             // Acquire segment headers from peers.
             let peers = match get_peers_result {
-                Ok(get_peers_stream) => get_peers_stream.collect::<Vec<_>>().await,
+                Ok(get_peers_stream) => {
+                    get_peers_stream
+                        .filter(|peer_id| {
+                            let known_peer = peer_segment_headers.contains_key(peer_id);
+
+                            async move { !known_peer }
+                        })
+                        .collect::<Vec<_>>()
+                        .await
+                }
                 Err(err) => {
                     warn!(?err, "get_closest_peers returned an error");
 
@@ -159,6 +169,7 @@ impl<'a> SegmentHeaderDownloader<'a> {
                         .dsn_node
                         .send_generic_request(
                             peer_id,
+                            Vec::new(),
                             SegmentHeaderRequest::LastSegmentHeaders {
                                 // Request 2 top segment headers, accounting for situations when new
                                 // segment header was just produced and not all nodes have it
@@ -344,6 +355,8 @@ impl<'a> SegmentHeaderDownloader<'a> {
     ) -> Result<(PeerId, Vec<SegmentHeader>), Box<dyn Error>> {
         trace!(?segment_indexes, "Getting segment header batch..");
 
+        let segment_indexes = Arc::new(segment_indexes);
+
         for &peer_id in peers {
             trace!(%peer_id, "get_closest_peers returned an item");
 
@@ -351,8 +364,9 @@ impl<'a> SegmentHeaderDownloader<'a> {
                 .dsn_node
                 .send_generic_request(
                     peer_id,
+                    Vec::new(),
                     SegmentHeaderRequest::SegmentIndexes {
-                        segment_indexes: segment_indexes.clone(),
+                        segment_indexes: Arc::clone(&segment_indexes),
                     },
                 )
                 .await;

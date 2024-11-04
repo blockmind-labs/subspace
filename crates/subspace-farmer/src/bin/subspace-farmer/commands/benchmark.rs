@@ -34,9 +34,9 @@ pub(crate) struct AuditOptions {
     #[arg(long)]
     with_single: bool,
     /// Size of PER FARM thread pool used for farming (mostly for blocking I/O, but also for some
-    /// compute-intensive operations during proving), defaults to number of logical CPUs
-    /// available on UMA system and number of logical CPUs in first NUMA node on NUMA system, but
-    /// not more than 32 threads
+    /// compute-intensive operations during proving). Defaults to the number of logical CPUs
+    /// on UMA systems, or the number of logical CPUs in the first NUMA node on NUMA systems, but
+    /// limited to 32 threads.
     #[arg(long)]
     farming_thread_pool_size: Option<NonZeroUsize>,
     /// Disk farm to audit
@@ -57,9 +57,9 @@ pub(crate) struct ProveOptions {
     #[arg(long)]
     with_single: bool,
     /// Size of PER FARM thread pool used for farming (mostly for blocking I/O, but also for some
-    /// compute-intensive operations during proving), defaults to number of logical CPUs
-    /// available on UMA system and number of logical CPUs in first NUMA node on NUMA system, but
-    /// not more than 32 threads
+    /// compute-intensive operations during proving). Defaults to the number of logical CPUs
+    /// on UMA systems, or the number of logical CPUs in the first NUMA node on NUMA systems, but
+    /// limited to 32 threads.
     #[arg(long)]
     farming_thread_pool_size: Option<NonZeroUsize>,
     /// Disk farm to prove
@@ -212,10 +212,9 @@ where
             });
         }
         {
-            let plot = RayonFiles::open_with(
-                &disk_farm.join(SingleDiskFarm::PLOT_FILE),
-                DirectIoFile::open,
-            )
+            let plot = RayonFiles::open_with(disk_farm.join(SingleDiskFarm::PLOT_FILE), |path| {
+                DirectIoFile::open(path)
+            })
             .map_err(|error| anyhow::anyhow!("Failed to open plot: {error}"))?;
             let plot_audit = PlotAudit::new(&plot);
 
@@ -250,7 +249,7 @@ where
             });
         }
         {
-            let plot = RayonFiles::open(&disk_farm.join(SingleDiskFarm::PLOT_FILE))
+            let plot = RayonFiles::open(disk_farm.join(SingleDiskFarm::PLOT_FILE))
                 .map_err(|error| anyhow::anyhow!("Failed to open plot: {error}"))?;
             let plot_audit = PlotAudit::new(&plot);
 
@@ -429,10 +428,9 @@ where
             });
         }
         {
-            let plot = RayonFiles::open_with(
-                &disk_farm.join(SingleDiskFarm::PLOT_FILE),
-                DirectIoFile::open,
-            )
+            let plot = RayonFiles::open_with(disk_farm.join(SingleDiskFarm::PLOT_FILE), |path| {
+                DirectIoFile::open(path)
+            })
             .map_err(|error| anyhow::anyhow!("Failed to open plot: {error}"))?;
             let plot_audit = PlotAudit::new(&plot);
             let mut options = PlotAuditOptions::<PosTable> {
@@ -504,7 +502,7 @@ where
             });
         }
         {
-            let plot = RayonFiles::open(&disk_farm.join(SingleDiskFarm::PLOT_FILE))
+            let plot = RayonFiles::open(disk_farm.join(SingleDiskFarm::PLOT_FILE))
                 .map_err(|error| anyhow::anyhow!("Failed to open plot: {error}"))?;
             let plot_audit = PlotAudit::new(&plot);
             let mut options = PlotAuditOptions::<PosTable> {

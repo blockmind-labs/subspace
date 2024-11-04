@@ -1,9 +1,3 @@
-// TODO: Remove
-#![allow(
-    clippy::needless_return,
-    reason = "https://github.com/rust-lang/rust-clippy/issues/13458"
-)]
-
 use super::persistent_parameters::remove_known_peer_addresses_internal;
 use crate::behavior::persistent_parameters::{append_p2p_suffix, remove_p2p_suffix};
 use crate::protocols::request_response::handlers::generic_request_handler::{
@@ -25,7 +19,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::sleep;
 
-#[tokio::test()]
+#[tokio::test]
 async fn test_address_timed_removal_from_known_peers_cache() {
     // Cache initialization
     let peer_id = PeerId::random();
@@ -92,7 +86,7 @@ async fn test_address_timed_removal_from_known_peers_cache() {
     assert_eq!(removed_addresses.len(), 2);
 }
 
-#[tokio::test()]
+#[tokio::test]
 async fn test_different_removal_timing_from_known_peers_cache() {
     // Cache initialization
     let peer_id = PeerId::random();
@@ -250,7 +244,7 @@ async fn test_async_handler_works_with_pending_internal_future() {
     });
 
     let resp = node_2
-        .send_generic_request(node_1.id(), ExampleRequest)
+        .send_generic_request(node_1.id(), Vec::new(), ExampleRequest)
         .await
         .unwrap();
 
@@ -282,7 +276,7 @@ async fn test_address_p2p_prefix_addition() {
     assert_eq!(append_p2p_suffix(peer_id, short_addr.clone()), long_addr);
 }
 
-#[tokio::test()]
+#[tokio::test]
 async fn test_known_peers_removal_address_after_specified_interval() {
     let config = KnownPeersManagerConfig {
         enable_known_peers_source: false,

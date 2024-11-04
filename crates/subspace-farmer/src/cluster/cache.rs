@@ -9,7 +9,7 @@
 
 use crate::cluster::controller::ClusterControllerCacheIdentifyBroadcast;
 use crate::cluster::nats_client::{
-    GenericBroadcast, GenericRequest, GenericStreamRequest, NatsClient, StreamRequest,
+    GenericBroadcast, GenericRequest, GenericStreamRequest, NatsClient,
 };
 use crate::farm::{FarmError, PieceCache, PieceCacheId, PieceCacheOffset};
 use anyhow::anyhow;
@@ -17,8 +17,9 @@ use async_trait::async_trait;
 use futures::stream::FuturesUnordered;
 use futures::{select, stream, FutureExt, Stream, StreamExt};
 use parity_scale_codec::{Decode, Encode};
-use std::future::{pending, Future};
-use std::pin::{pin, Pin};
+use std::collections::BTreeSet;
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use subspace_core_primitives::pieces::{Piece, PieceIndex};
 use tokio::time::MissedTickBehavior;
@@ -78,7 +79,18 @@ impl GenericRequest for ClusterCacheReadPieceRequest {
     type Response = Result<Option<(PieceIndex, Piece)>, String>;
 }
 
-/// Request plotted from farmer, request
+/// Read piece from cache
+#[derive(Debug, Clone, Encode, Decode)]
+pub(super) struct ClusterCacheReadPiecesRequest {
+    pub(super) offsets: Vec<PieceCacheOffset>,
+}
+
+impl GenericStreamRequest for ClusterCacheReadPiecesRequest {
+    const SUBJECT: &'static str = "subspace.cache.*.read-pieces";
+    type Response = Result<(PieceCacheOffset, Option<(PieceIndex, Piece)>), String>;
+}
+
+/// Collect plotted pieces from farmer
 #[derive(Debug, Clone, Encode, Decode)]
 struct ClusterCacheContentsRequest;
 
@@ -120,7 +132,7 @@ impl PieceCache for ClusterPieceCache {
     > {
         Ok(Box::new(
             self.nats_client
-                .stream_request(ClusterCacheContentsRequest, Some(&self.cache_id_string))
+                .stream_request(&ClusterCacheContentsRequest, Some(&self.cache_id_string))
                 .await?
                 .map(|response| response.map_err(FarmError::from)),
         ))
@@ -169,6 +181,55 @@ impl PieceCache for ClusterPieceCache {
                 Some(&self.cache_id_string),
             )
             .await??)
+    }
+
+    async fn read_pieces(
+        &self,
+        offsets: Box<dyn Iterator<Item = PieceCacheOffset> + Send>,
+    ) -> Result<
+        Box<
+            dyn Stream<Item = Result<(PieceCacheOffset, Option<(PieceIndex, Piece)>), FarmError>>
+                + Send
+                + Unpin
+                + '_,
+        >,
+        FarmError,
+    > {
+        let offsets = offsets.collect::<Vec<_>>();
+        let mut offsets_set = BTreeSet::from_iter(offsets.iter().copied());
+        let mut stream = self
+            .nats_client
+            .stream_request(
+                &ClusterCacheReadPiecesRequest { offsets },
+                Some(&self.cache_id_string),
+            )
+            .await?
+            .map(|response| response.map_err(FarmError::from))
+            .fuse();
+        Ok(Box::new(stream::poll_fn(move |cx| {
+            if !stream.is_done() {
+                match stream.poll_next_unpin(cx) {
+                    Poll::Ready(Some(response)) => {
+                        return Poll::Ready(Some(response.inspect(|(offset, _)| {
+                            offsets_set.remove(offset);
+                        })));
+                    }
+                    Poll::Ready(None) => {
+                        // Handled as a general case below
+                    }
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
+                }
+            }
+
+            // Uphold invariant of the trait that some result should be returned for every unique
+            // provided offset
+            match offsets_set.pop_first() {
+                Some(offset) => Poll::Ready(Some(Ok((offset, None)))),
+                None => Poll::Ready(None),
+            }
+        })))
     }
 }
 
@@ -240,6 +301,9 @@ where
             result = read_piece_responder(&nats_client, &caches_details).fuse() => {
                 result
             },
+            result = read_pieces_responder(&nats_client, &caches_details).fuse() => {
+                result
+            },
             result = contents_responder(&nats_client, &caches_details).fuse() => {
                 result
             },
@@ -253,6 +317,9 @@ where
                 result
             },
             result = read_piece_responder(&nats_client, &caches_details).fuse() => {
+                result
+            },
+            result = read_pieces_responder(&nats_client, &caches_details).fuse() => {
                 result
             },
             result = contents_responder(&nats_client, &caches_details).fuse() => {
@@ -377,6 +444,7 @@ where
                         )
                     },
                 )
+                .instrument(info_span!("", cache_id = %cache_details.cache_id))
                 .await
         })
         .collect::<FuturesUnordered<_>>()
@@ -409,6 +477,7 @@ where
                         )
                     },
                 )
+                .instrument(info_span!("", cache_id = %cache_details.cache_id))
                 .await
         })
         .collect::<FuturesUnordered<_>>()
@@ -441,6 +510,51 @@ where
                         )
                     },
                 )
+                .instrument(info_span!("", cache_id = %cache_details.cache_id))
+                .await
+        })
+        .collect::<FuturesUnordered<_>>()
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("No caches"))?
+}
+
+async fn read_pieces_responder<C>(
+    nats_client: &NatsClient,
+    caches_details: &[CacheDetails<'_, C>],
+) -> anyhow::Result<()>
+where
+    C: PieceCache,
+{
+    caches_details
+        .iter()
+        .map(|cache_details| async move {
+            nats_client
+                .stream_request_responder::<_, _, Pin<Box<dyn Stream<Item = _> + Send>>, _>(
+                    Some(cache_details.cache_id_string.as_str()),
+                    Some(cache_details.cache_id_string.clone()),
+                    |ClusterCacheReadPiecesRequest { offsets }| async move {
+                        Some(
+                            match cache_details
+                                .cache
+                                .read_pieces(Box::new(offsets.into_iter()))
+                                .await
+                            {
+                                Ok(contents) => Box::pin(contents.map(|maybe_cache_element| {
+                                    maybe_cache_element.map_err(|error| error.to_string())
+                                })) as _,
+                                Err(error) => {
+                                    error!(%error, "Failed to read pieces");
+
+                                    Box::pin(stream::once(async move {
+                                        Err(format!("Failed to read pieces: {error}"))
+                                    })) as _
+                                }
+                            },
+                        )
+                    },
+                )
+                .instrument(info_span!("", cache_id = %cache_details.cache_id))
                 .await
         })
         .collect::<FuturesUnordered<_>>()
@@ -458,93 +572,31 @@ where
 {
     caches_details
         .iter()
-        .enumerate()
-        .map(|(cache_index, cache_details)| async move {
-            // Initialize with pending future so it never ends
-            let mut processing = FuturesUnordered::from_iter([
-                Box::pin(pending()) as Pin<Box<dyn Future<Output = ()> + Send>>
-            ]);
-            let mut subscription = nats_client
-                .subscribe_to_stream_requests(
-                    Some(&cache_details.cache_id_string),
+        .map(|cache_details| async move {
+            nats_client
+                .stream_request_responder::<_, _, Pin<Box<dyn Stream<Item = _> + Send>>, _>(
+                    Some(cache_details.cache_id_string.as_str()),
                     Some(cache_details.cache_id_string.clone()),
+                    |_request: ClusterCacheContentsRequest| async move {
+                        Some(match cache_details.cache.contents().await {
+                            Ok(contents) => Box::pin(contents.map(|maybe_cache_element| {
+                                maybe_cache_element.map_err(|error| error.to_string())
+                            })) as _,
+                            Err(error) => {
+                                error!(%error, "Failed to get contents");
+
+                                Box::pin(stream::once(async move {
+                                    Err(format!("Failed to get contents: {error}"))
+                                })) as _
+                            }
+                        })
+                    },
                 )
+                .instrument(info_span!("", cache_id = %cache_details.cache_id))
                 .await
-                .map_err(|error| {
-                    anyhow!(
-                        "Failed to subscribe to contents requests for cache {}: {}",
-                        cache_details.cache_id,
-                        error
-                    )
-                })?
-                .fuse();
-
-            loop {
-                select! {
-                    maybe_message = subscription.next() => {
-                        let Some(message) = maybe_message else {
-                            break;
-                        };
-
-                        // Create background task for concurrent processing
-                        processing.push(Box::pin(
-                            process_contents_request(
-                                nats_client,
-                                cache_details,
-                                message,
-                            )
-                            .instrument(info_span!("", %cache_index))
-                        ));
-                    }
-                    _ = processing.next() => {
-                        // Nothing to do here
-                    }
-                }
-            }
-
-            Ok(())
         })
         .collect::<FuturesUnordered<_>>()
         .next()
         .await
         .ok_or_else(|| anyhow!("No caches"))?
-}
-
-async fn process_contents_request<C>(
-    nats_client: &NatsClient,
-    cache_details: &CacheDetails<'_, C>,
-    request: StreamRequest<ClusterCacheContentsRequest>,
-) where
-    C: PieceCache,
-{
-    trace!(?request, "Contents request");
-
-    match cache_details.cache.contents().await {
-        Ok(contents) => {
-            nats_client
-                .stream_response::<ClusterCacheContentsRequest, _>(
-                    request.response_subject,
-                    contents.map(|maybe_cache_element| {
-                        maybe_cache_element.map_err(|error| error.to_string())
-                    }),
-                )
-                .await;
-        }
-        Err(error) => {
-            error!(
-                %error,
-                cache_id = %cache_details.cache_id,
-                "Failed to get contents"
-            );
-
-            nats_client
-                .stream_response::<ClusterCacheContentsRequest, _>(
-                    request.response_subject,
-                    pin!(stream::once(async move {
-                        Err(format!("Failed to get contents: {error}"))
-                    })),
-                )
-                .await;
-        }
-    }
 }
