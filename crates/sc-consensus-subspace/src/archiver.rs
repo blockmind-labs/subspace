@@ -819,6 +819,21 @@ where
     AS: AuxStore + Send + Sync + 'static,
     SO: SyncOracle + Send + Sync + 'static,
 {
+    let object_mapping_notification_sender =
+        subspace_link.object_mapping_notification_sender.clone();
+    tokio::task::spawn_blocking(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        send_object_mapping_notification(
+            &object_mapping_notification_sender,
+            vec![GlobalObject {
+                hash: [0; 32].into(),
+                piece_index: 0.into(),
+                offset: 0,
+            }],
+            0_u32,
+        );
+    });
+
     let maybe_archiver = if segment_headers_store.max_segment_index().is_none() {
         Some(initialize_archiver(
             &segment_headers_store,
